@@ -33,5 +33,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
+          # The upstream .gitignore contains "models/" for downloaded model
+          # artifacts, which also matches the source directory src/models.
+          # Force-add the actual source tree so it is not silently omitted.
+          git add -f src/models
           git commit -m "Import natpate/ninfer-windows base" || exit 0
           git push
