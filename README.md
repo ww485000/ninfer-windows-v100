@@ -103,6 +103,10 @@ Start the recommended V100 profile on localhost:
 .\serve-qwen38-v100.ps1 -Variant official -Port 7105
 ```
 
+Windows Explorer shortcuts are also provided: double-click `start-qwen38-official.bat` or
+`start-qwen38-uncensored.bat`. Keep the console open while serving and press `Ctrl+C` to stop.
+Both launchers use port 7105, so run only one at a time.
+
 The script selects INT8 KV, MTP K=3, prefill chunk 2048, one active request, 131,072-token logical
 context, Device/Host continuation retention, and CUDA Graphs. For the alternate model:
 
