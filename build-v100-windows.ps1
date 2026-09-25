@@ -59,7 +59,25 @@ Write-Host "[OK] Using CUDA Toolkit: $cudaRoot"
 Write-Host ($nvccVersion.Trim())
 
 $gpuNames = & nvidia-smi.exe --query-gpu=name --format=csv,noheader 2>$null
-if (-not ($gpuNames -match "V100")) { throw "No Tesla V100 was detected by Windows nvidia-smi. Detected: $gpuNames" }
+
+# Some Tesla V100 boards are reported by Windows drivers using the board/platform
+# identifier (for example "Tesla PG503-216") instead of the marketing name "V100".
+# Prefer compute capability as the architecture check when available.
+$computeCaps = & nvidia-smi.exe --query-gpu=compute_cap --format=csv,noheader 2>$null
+$hasVolta70 = $false
+if ($LASTEXITCODE -eq 0 -and $computeCaps) {
+  $hasVolta70 = ($computeCaps -match "^7\.0$")
+}
+
+$knownV100Name = ($gpuNames -match "V100") -or ($gpuNames -match "PG503-216")
+if (-not ($knownV100Name -or $hasVolta70)) {
+  throw "No Volta sm_70 / Tesla V100-class GPU was detected by Windows nvidia-smi. Name: $gpuNames Compute capability: $computeCaps"
+}
+
+Write-Host "[OK] Volta sm_70 GPU detected: $gpuNames"
+if ($computeCaps) {
+  Write-Host "[OK] Compute capability: $computeCaps"
+}
 
 $driverInfo = & nvidia-smi.exe -q | Out-String
 if ($driverInfo -match "Driver Model[\s\S]*?Current\s*:\s*TCC") {
