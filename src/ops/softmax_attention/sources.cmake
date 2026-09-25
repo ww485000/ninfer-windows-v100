@@ -16,6 +16,8 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/sliding_window/launch.cu"
 )
 
-target_sources(ninfer_nvfp4_non_rdc PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc.cu"
-)
+if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_sources(ninfer_nvfp4_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc.cu"
+  )
+endif()
