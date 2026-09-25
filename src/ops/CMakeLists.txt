@@ -12,6 +12,11 @@ ninfer_internal_includes(ninfer_nvfp4_non_rdc)
 ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
 target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
 
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_sources(ninfer_nvfp4_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_non_rdc_volta_stub.cpp")
+endif()
+
 include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
