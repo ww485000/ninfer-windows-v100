@@ -327,14 +327,23 @@ public:
         OVERLAPPED operation{};
         operation.Offset     = static_cast<DWORD>(absolute_offset);
         operation.OffsetHigh = static_cast<DWORD>(absolute_offset >> 32U);
+        operation.hEvent     = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (operation.hEvent == nullptr) {
+            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                                    "create direct artifact read event");
+        }
         DWORD bytes           = 0;
-        if (!::ReadFile(file_, destination.data(), static_cast<DWORD>(destination.size()), &bytes,
-                        &operation)) {
-            const auto error = ::GetLastError();
-            if (error != ERROR_HANDLE_EOF) {
-                throw std::system_error(static_cast<int>(error), std::system_category(),
-                                        "direct artifact read");
-            }
+        BOOL complete = ::ReadFile(file_, destination.data(), static_cast<DWORD>(destination.size()),
+                                   &bytes, &operation);
+        DWORD error   = complete ? ERROR_SUCCESS : ::GetLastError();
+        if (!complete && error == ERROR_IO_PENDING) {
+            complete = ::GetOverlappedResult(file_, &operation, &bytes, TRUE);
+            error    = complete ? ERROR_SUCCESS : ::GetLastError();
+        }
+        ::CloseHandle(operation.hEvent);
+        if (!complete && error != ERROR_HANDLE_EOF) {
+            throw std::system_error(static_cast<int>(error), std::system_category(),
+                                    "direct artifact read");
         }
         return bytes;
 #else
