@@ -93,3 +93,31 @@ build-v100/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4.ninfer \
 官方上游 v3 工件可用本分支直接加载，例如
 [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)。
 v2 工件（magic `NInfer\0\2`）照常工作，无需任何改动。
+
+仓库根目录提供经过 Windows 验证的下载和启动入口：
+
+```powershell
+.\download-qwen38-v100.ps1 -Variant all
+.\run-qwen38-v100.ps1 -Variant official -NoThinking -Prompt "计算 37 乘以 43。"
+.\serve-qwen38-v100.ps1 -Variant official -Port 7105
+```
+
+`-Variant uncensored` 选择第三方
+[`JMVRoill/Qwen3.8-27B-Uncensored-nvfp4-NInfer`](https://huggingface.co/JMVRoill/Qwen3.8-27B-Uncensored-nvfp4-NInfer)。
+下载脚本固定文件大小和 SHA-256；服务将它发布为 `qwen3.8-27b-uncensored`，避免与官方权重混淆。
+该 artifact 的安全对齐已被大幅移除，发布者没有对它运行完整能力评测，也没有证明它与官方模型质量等价；
+不要在没有外部审核、权限控制和内容治理的情况下向不受信任用户开放。
+
+## Windows 实测
+
+2026-09-26 在 Tesla PG503-216 32GB、驱动 576.57、CUDA 12.9 上，以官方
+`ninfer_bench` Engine 路线测量。配置为 INT8 group-64 KV、CUDA Graph、MTP K=3、优化 proposal
+head、`--prefill-chunk 2048`，每项一次预热、三次测量：
+
+| Artifact | pp2048 | pp2048+tg256 | MTP 接受率 |
+|---|---:|---:|---:|
+| 官方 Qwen3.8-27B NVFP4 v3 | 1,135.88 tok/s | 228.14 tok/s | 99.17% |
+| Uncensored NVFP4 v2 | 1,130.50 tok/s | 228.08 tok/s | 99.17% |
+
+这是固定 corpus 的高接受率性能测试，不代表所有自然语言提示的吞吐。普通提示的速度仍取决于上下文长度和
+MTP 接受率。两份原始 schema-v14 报告保存在本机 `profiles/bench/`，该目录不纳入 Git。
