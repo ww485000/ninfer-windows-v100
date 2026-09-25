@@ -29,20 +29,34 @@ $cmake = Require-Command "cmake.exe"
 $null = Require-Command "cl.exe"
 $null = Require-Command "nvidia-smi.exe"
 
-$cudaRoot = $env:CUDA_PATH_V12_8
-if (-not $cudaRoot) {
-  $candidate = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
-  if (Test-Path (Join-Path $candidate "bin\nvcc.exe")) { $cudaRoot = $candidate }
+$cudaRoot = $null
+if ($env:CUDA_PATH_V12_9 -and (Test-Path (Join-Path $env:CUDA_PATH_V12_9 "bin\nvcc.exe"))) {
+  $cudaRoot = $env:CUDA_PATH_V12_9
+} elseif ($env:CUDA_PATH_V12_8 -and (Test-Path (Join-Path $env:CUDA_PATH_V12_8 "bin\nvcc.exe"))) {
+  $cudaRoot = $env:CUDA_PATH_V12_8
+} else {
+  $candidates = @(
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9",
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+  )
+  foreach ($candidate in $candidates) {
+    if (Test-Path (Join-Path $candidate "bin\nvcc.exe")) {
+      $cudaRoot = $candidate
+      break
+    }
+  }
 }
-if (-not $cudaRoot) { throw "CUDA Toolkit 12.8 was not found. Install CUDA 12.8 or set CUDA_PATH_V12_8." }
+
+if (-not $cudaRoot) { throw "CUDA Toolkit 12.8 or 12.9 was not found. Install one of them." }
 
 $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
-if (-not (Test-Path $nvcc)) { throw "nvcc.exe not found at $nvcc" }
-
 $nvccVersion = & $nvcc --version | Out-String
-if ($nvccVersion -notmatch "release\s+12\.8") {
-  throw "This V100 port requires CUDA Toolkit 12.8 exactly. nvcc reported: $nvccVersion"
+if ($nvccVersion -notmatch "release\s+12\.(8|9)") {
+  throw "This V100 port requires CUDA Toolkit 12.8 or 12.9. nvcc reported: $nvccVersion"
 }
+
+Write-Host "[OK] Using CUDA Toolkit: $cudaRoot"
+Write-Host ($nvccVersion.Trim())
 
 $gpuNames = & nvidia-smi.exe --query-gpu=name --format=csv,noheader 2>$null
 if (-not ($gpuNames -match "V100")) { throw "No Tesla V100 was detected by Windows nvidia-smi. Detected: $gpuNames" }
@@ -59,10 +73,9 @@ if ($Clean -and (Test-Path $BuildDir)) {
   Remove-Item -Recurse -Force $BuildDir
 }
 
-# Required by the native Windows port. cl.exe and the host compiler launched by nvcc both inherit CL.
 $env:CL = "/Zc:preprocessor /utf-8"
 
-Write-Host "[Configure] CUDA 12.8, sm_70, VS2022 x64"
+Write-Host "[Configure] CUDA 12.8/12.9, sm_70, VS2022 x64"
 $configureArgs = @(
   "-S", ".",
   "-B", $BuildDir,
