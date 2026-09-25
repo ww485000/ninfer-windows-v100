@@ -21,11 +21,10 @@ jobs:
           set -euo pipefail
           workdir="$(mktemp -d)"
           git clone --depth 1 https://github.com/natpate/ninfer-windows.git "$workdir/upstream"
-          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          cp -a "$workdir/upstream/." .
-          rm -rf .git
-          # Restore this repository's git metadata is handled by the checkout worktree.
-          # The .git directory was excluded above from deletion.
+          rsync -a --delete \
+            --exclude='.git' \
+            --exclude='.github/workflows/bootstrap.yml' \
+            "$workdir/upstream/" ./
           git status --short
 
       - name: Commit imported base
