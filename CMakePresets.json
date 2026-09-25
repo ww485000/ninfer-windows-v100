@@ -22,31 +22,11 @@
         "BUILD_TESTING": "ON",
         "NINFER_BUILD_BENCHMARKS": "ON"
       }
-    },
-    {
-      "name": "v100-release",
-      "displayName": "Windows Tesla V100 (sm_70) Release",
-      "generator": "Visual Studio 17 2022",
-      "architecture": "x64",
-      "binaryDir": "${sourceDir}/build-v100",
-      "cacheVariables": {
-        "CMAKE_CUDA_ARCHITECTURES": "70",
-        "NINFER_BUILD_APPS": "ON",
-        "BUILD_TESTING": "OFF",
-        "NINFER_BUILD_BENCHMARKS": "OFF",
-        "NINFER_BUILD_PRODUCT_SUPPORT": "ON",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
-      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
-    { "name": "dev", "configurePreset": "dev" },
-    {
-      "name": "v100-release",
-      "configurePreset": "v100-release",
-      "configuration": "Release"
-    }
+    { "name": "dev", "configurePreset": "dev" }
   ],
   "testPresets": [
     {
