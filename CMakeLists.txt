@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 
 # Windows + V100 port:
-# - sm_70 / Volta uses CUDA Toolkit 12.8 (CUDA 13 removed offline Volta compilation)
+# - sm_70 / Volta supports CUDA Toolkit 12.8 or 12.9
+# - CUDA 13.x is rejected because offline Volta compilation was removed
 # - sm_120a keeps the original Windows/Blackwell path
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures to build")
@@ -19,7 +20,6 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
-# --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build the NInfer test suite" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build the NInfer benchmark binaries" OFF)
@@ -34,7 +34,6 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Architecture-specific toolkit contract.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a" AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
   message(FATAL_ERROR
@@ -45,20 +44,17 @@ endif()
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70" AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
   message(FATAL_ERROR
-    "Tesla V100 / sm_70 requires CUDA Toolkit 12.8; found "
+    "Tesla V100 / sm_70 requires CUDA Toolkit 12.8 or 12.9; found "
     "${CMAKE_CUDA_COMPILER_VERSION}")
 endif()
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70" AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
   message(FATAL_ERROR
-    "Tesla V100 / sm_70 must be built with CUDA Toolkit 12.8. CUDA 13.x no longer "
+    "Tesla V100 / sm_70 must be built with CUDA Toolkit 12.8 or 12.9. CUDA 13.x no longer "
     "assembles Volta device code; found ${CMAKE_CUDA_COMPILER_VERSION}")
 endif()
 
-# The Linux V100 port uses NVIDIA CUTLASS for the Volta FP16 tensor-core path.
-# Keep the same pinned version here so the Windows and Linux sm_70 kernels share
-# the same implementation contract.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   include(FetchContent)
   set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only CUTLASS headers" FORCE)
@@ -77,16 +73,11 @@ if(MSVC)
   add_compile_definitions(
     CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
     NOMINMAX)
-
-  # Keep these in the CL environment rather than CMAKE_*_FLAGS: nvcc/MSBuild
-  # does not reliably forward raw MSVC switches passed through the CUDA flags.
-  # build-v100-windows.ps1 sets them automatically.
 endif()
 
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
 
-# --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)
