@@ -1,0 +1,38 @@
+name: Bootstrap upstream Windows base
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Import natpate/ninfer-windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          git clone --depth 1 https://github.com/natpate/ninfer-windows.git "$workdir/upstream"
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$workdir/upstream/." .
+          rm -rf .git
+          # Restore this repository's git metadata is handled by the checkout worktree.
+          # The .git directory was excluded above from deletion.
+          git status --short
+
+      - name: Commit imported base
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import natpate/ninfer-windows base" || exit 0
+          git push
