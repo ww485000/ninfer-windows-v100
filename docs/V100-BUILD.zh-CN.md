@@ -1,123 +1,123 @@
 [English](V100-BUILD.md) | **简体中文**
 
-# 在 Tesla V100 (sm_70) 上编译并运行 NInfer——经验证的完整指南
+# Windows V100 编译与运行指南
 
-本指南反映的是一套在 Tesla V100-PCIe-32GB（PCIe 版，非 SXM）上**真实生产运行**的构建。走到这一步花了一整天排错；下面是提炼后的、已验证的路径。
+本指南只面向本仓库唯一支持的部署目标：64 位 Windows、单张 Tesla V100 32GB、TCC 模式。
+本项目不支持 Linux、WSL、Docker、RTX 或 Blackwell 构建。
 
-已验证环境：
+## 已验证配置
 
-| 组件 | 版本 |
+| 组件 | 已验证配置 |
 |---|---|
-| GPU | Tesla V100-PCIe-32GB (sm_70)，驱动 580 |
-| 操作系统 | Ubuntu 24.04 |
-| CUDA toolkit (nvcc) | 12.8 (12.8.93)，与系统 CUDA 12.0 并存安装 |
-| CMake | 3.28.3 |
-| CUTLASS | 4.4.2（本地 tarball） |
-| 库 | libcurl 8.5，ffmpeg 60.x（libavformat/libavcodec/libavutil/libswscale） |
+| GPU | Tesla PG503-216 32GB，Volta 计算能力 7.0 |
+| 驱动 | 576.57，TCC |
+| 系统 | Windows 10 64 位 |
+| CUDA | 12.9；脚本也接受 12.8 |
+| 编译器 | Visual Studio 2022 Community，MSVC 14.44 |
+| CMake | 4.4.3 |
+| 依赖 | vcpkg x64-windows manifest |
 
-## 太长不看版（TL;DR）
+## 前置条件
 
-```bash
-# 1. 系统软件包
-sudo apt-get install -y build-essential cmake pkg-config \
-  libcurl4-openssl-dev libavformat-dev libavcodec-dev \
-  libavutil-dev libswscale-dev
+1. 安装 NVIDIA 数据中心驱动，确认 `nvidia-smi` 显示 V100/PG503-216、32GB、计算能力 7.0、TCC。
+2. 安装 CUDA Toolkit 12.8 或 12.9。
+3. 安装 Visual Studio 2022，勾选 Desktop development with C++ 和 Windows SDK。
+4. 安装 Git、CMake、vcpkg。下文假设 vcpkg 位于 `C:\src\vcpkg`。
+5. 单模型至少预留 50GB；同时保留官方与 uncensored 模型建议至少 75GB。
 
-# 2. CUDA toolkit 12.8+（nvcc）。我们系统的 toolkit 是 12.0；我们并行安装了
-#    12.8（静默安装 toolkit 不动驱动），并让 CMake 显式指向它。
-#    https://developer.nvidia.com/cuda-downloads
+## 编译
 
-# 3. 源码
-git clone https://github.com/liujun-7788/ninfer-v3-v100.git
-cd ninfer-v3-v100
+在仓库根目录的普通 PowerShell 中执行：
 
-# 4. CUTLASS 4.4.2 放本地目录（见坑 2）
-wget https://github.com/NVIDIA/cutlass/archive/refs/tags/v4.4.2.tar.gz \
-  -O cutlass-4.4.2.tar.gz
-tar xzf cutlass-4.4.2.tar.gz
-# 如果 tarball 解压出双层嵌套（cutlass-4.4.2/cutlass-4.4.2/），
-# 把内层拍平上来，确保 ./cutlass-4.4.2/CMakeLists.txt 存在
-
-# 5. 配置 + 编译（只编 sm_70——这是最大的提速点）
-cmake -B build-v100 -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=70 \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-  -DFETCHCONTENT_SOURCE_DIR_CUTLASS=$PWD/cutlass-4.4.2
-cmake --build build-v100 -j$(nproc)
-
-# 产物：build-v100/apps/ninfer-serve
+```powershell
+powershell -ExecutionPolicy Bypass -Command `
+  ".\build-v100-windows.ps1 -VcpkgRoot C:\src\vcpkg -Clean 2>&1 | Tee-Object build-v100.log"
 ```
 
-## 我们踩过的坑（一天时间花在哪）
+脚本会查找 Visual Studio 和 CUDA、验证 GPU、配置 `sm_70`、恢复 vcpkg manifest，并编译三个
+Release 应用。成功后生成：
 
-1. **`CMAKE_CUDA_ARCHITECTURES=70`。** 默认配置会为一长串架构编译（70 到 121a）。显式传 `70`——V100 分支的内核本来就硬性检查计算能力 7.0（RTX 4090 是 sm_89，跑不了这个构建，启动时会被拒绝；不要试图用别的卡替代），编译速度也大幅加快。
-
-2. **CUTLASS 走 FetchContent。** 如果你的网络到不了 GitHub（我们的生产机到不了），CMake 的 FetchContent 下载会挂起或失败。手动下载 v4.4.2 tarball，并把 `-DFETCHCONTENT_SOURCE_DIR_CUTLASS` 指向解压目录。注意：tag tarball 解压后可能**双层嵌套**（`cutlass-4.4.2/cutlass-4.4.2/`）——把内层拍平上来，确保 `<目录>/CMakeLists.txt` 存在，否则配置失败。
-
-3. **CUDA toolkit 版本。** 我们用 toolkit 12.8（nvcc 12.8.93）验证通过，系统默认是 12.0。上游项目面向 Blackwell（sm_120a）并假定 12.8；与其和混合工具链搏斗，不如并行安装 12.8（不碰驱动），并传 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc`。
-
-4. **链接阶段的 nvlink `Skipping incompatible ...` 警告**（libdl / librt / libpthread）无害——引擎链接与运行正常。不要去追它们。
-
-5. **媒体前端。** 图像/视频输入需要 ffmpeg 开发库（libavformat/libavcodec/libavutil/libswscale）与 libcurl，配置阶段经 pkg-config 检测。想要文本之外的输入输出，请在 cmake 之前装好。
-
-## V100 上重要的运行参数
-
-我们每天运行的生产线（Qwen3.8-27B NVFP4，官方 v3 工件）：
-
-```bash
-build-v100/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 7105 --device 0 --model-id qwen3.8-27b \
-  --max-context 131072 --kv-capacity auto --max-concurrency 1 \
-  --kv-dtype int8 --device-state-slots 1 --host-state-slots 8 \
-  --host-kv-mib 8192 --spec mtp --draft-tokens 3 --lm-head-draft \
-  --preserve-thinking --pending-timeout-ms 600000
+```text
+build-v100\apps\Release\ninfer.exe
+build-v100\apps\Release\ninfer-serve.exe
+build-v100\apps\Release\ninfer-perplexity.exe
 ```
 
-- **CUDA Graphs 在 V100 上可用**（这套设置下捕获约 0.3–0.7 秒）。如果捕获 OOM，说明你的 KV 预算对剩余显存太激进：先降 `--max-context`；万不得已才退到 `--no-cuda-graph`。
-- **MTP 草稿 token 数（K）。** 我们在 Qwen3.8-27B NVFP4 上用真实 HTTP 负载扫了 K=2..5（上下文 2K/8K/32K/64K/128K，各 3 次重复，各 K 使用完全相同的提示）：
+之后修改源码可用增量编译：
 
-  | K | 平均解码 tok/s（5 档 ctx） | 2K | 8K | 32K | 64K | 128K | 接受率中位数 |
-  |---|---:|---:|---:|---:|---:|---:|---:|
-  | 2 | 78.2 | 80.7 | 119.6 | 85.1 | 70.6 | 35.2 | 71.3% |
-  | **3** | **84.2** | **123.0** | **115.4** | 78.7 | 56.4 | **47.5** | 70.0% |
-  | 4 | 61.7 | 73.3 | 75.5 | 73.6 | 54.8 | 31.1 | 42.9% |
-  | 5 | 77.4 | 109.7 | 90.3 | 85.1 | 69.8 | 32.2 | 66.1% |
-
-  **K=3 是综合最优默认值。** 64K 上下文时 K=2 胜出；K=4 崩塌（接受率跌到约 40–47%，吞吐随之下降）。Prefill 与 K 无关（每个上下文档位跨 K 波动 <1%）。
-
-- **Prefill 是串行的。** 引擎一次只跑一个 prefill；并发请求会排队，若 prefill 超过 `--pending-timeout-ms`（默认 30 秒）将收到 HTTP 503。生产环境请调大（我们用 600000），或保持 `--max-concurrency 1`。
-- **首次冷启动需要几分钟**（权重分页 + 图捕获）。用 HTTP 端点（`GET /v1/models`）探测就绪，不要看 systemd 状态——unit 可能显示 "active" 而引擎尚未监听。
+```powershell
+cmake --build build-v100 --config Release -j
+```
 
 ## 模型
 
-官方上游 v3 工件可用本分支直接加载，例如
-[neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)。
-v2 工件（magic `NInfer\0\2`）照常工作，无需任何改动。
-
-仓库根目录提供经过 Windows 验证的下载和启动入口：
+请使用仓库下载脚本，以获得断点续传、精确文件大小检查和 SHA-256 校验：
 
 ```powershell
+.\download-qwen38-v100.ps1 -Variant official
+.\download-qwen38-v100.ps1 -Variant uncensored
 .\download-qwen38-v100.ps1 -Variant all
-.\run-qwen38-v100.ps1 -Variant official -NoThinking -Prompt "计算 37 乘以 43。"
+```
+
+| 版本 | 发布 SHA-256 |
+|---|---|
+| 官方 v3 | `74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82` |
+| Uncensored v2 | `43025bb64f2cb558d9ede6269f8a3c2ed8ebfa4619344fe1ba8e955ba4979218` |
+
+uncensored artifact 来自第三方，已降低安全对齐，且没有完整能力或安全评测。
+
+## CLI
+
+```powershell
+.\run-qwen38-v100.ps1 `
+  -Variant official `
+  -NoThinking `
+  -Prompt "计算 37 乘以 43。" `
+  -MaxNew 128
+```
+
+脚本会把 prompt 写入临时 UTF-8 messages 文件，使中文和其他 Unicode 文本绕过 Windows 窄字符
+命令行编码问题。
+
+## 服务
+
+```powershell
 .\serve-qwen38-v100.ps1 -Variant official -Port 7105
 ```
 
-`-Variant uncensored` 选择第三方
-[`JMVRoill/Qwen3.8-27B-Uncensored-nvfp4-NInfer`](https://huggingface.co/JMVRoill/Qwen3.8-27B-Uncensored-nvfp4-NInfer)。
-下载脚本固定文件大小和 SHA-256；服务将它发布为 `qwen3.8-27b-uncensored`，避免与官方权重混淆。
-该 artifact 的安全对齐已被大幅移除，发布者没有对它运行完整能力评测，也没有证明它与官方模型质量等价；
-不要在没有外部审核、权限控制和内容治理的情况下向不受信任用户开放。
+验证配置使用 `--prefill-chunk 2048`、INT8 group-64 KV、MTP K=3、优化 proposal head、
+131,072 逻辑上下文、单活跃请求、一个 Device 检查点、八个 Host State 槽和 8GiB Host KV。
+使用 `-Variant uncensored` 时，服务模型 ID 为 `qwen3.8-27b-uncensored`。
+
+模型加载完成后通过 HTTP 判断就绪：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:7105/v1/models
+```
 
 ## Windows 实测
 
-2026-09-26 在 Tesla PG503-216 32GB、驱动 576.57、CUDA 12.9 上，以官方
-`ninfer_bench` Engine 路线测量。配置为 INT8 group-64 KV、CUDA Graph、MTP K=3、优化 proposal
-head、`--prefill-chunk 2048`，每项一次预热、三次测量：
+在上述验证系统上，使用 INT8 KV、CUDA Graph、MTP K=3、优化 proposal head、prefill chunk
+2048、一次丢弃预热和三次测量：
 
 | Artifact | pp2048 | pp2048+tg256 | MTP 接受率 |
 |---|---:|---:|---:|
 | 官方 Qwen3.8-27B NVFP4 v3 | 1,135.88 tok/s | 228.14 tok/s | 99.17% |
-| Uncensored NVFP4 v2 | 1,130.50 tok/s | 228.08 tok/s | 99.17% |
+| Uncensored Qwen3.8-27B NVFP4 v2 | 1,130.50 tok/s | 228.08 tok/s | 99.17% |
 
-这是固定 corpus 的高接受率性能测试，不代表所有自然语言提示的吞吐。普通提示的速度仍取决于上下文长度和
-MTP 接受率。两份原始 schema-v14 报告保存在本机 `profiles/bench/`，该目录不纳入 Git。
+完整复现命令见根目录 README。该结果使用高接受率固定语料，不代表任意自然语言提示的固定速度。
+
+## 常见问题
+
+- artifact 加载出现 `ERROR_IO_PENDING`：可执行文件早于 Windows overlapped I/O 修复，请重新编译。
+- 退出码 `0xC0000135`：EXE 旁缺少 vcpkg DLL；请直接使用构建脚本生成的 Release 目录。
+- CUDA Graph OOM：上下文/KV 分配过大；先降低上下文，再考虑禁用 graph。
+- 只有 reasoning、最终答案为空：thinking 用完了 `max_tokens`；CLI 使用 `-NoThinking`，HTTP 使用
+  `reasoning_effort: "none"`。
+- 首次启动包含权重上传、Volta 权重重排、缓存分配与 graph 捕获。请探测 `/v1/models`，不要把
+  进程已经创建当作服务就绪。
+
+## 支持边界
+
+只有原生 Windows 加单张 V100 32GB 经过验证。Linux、WSL、Docker、V100 16GB、其他 GPU、
+多 GPU、修改后的 artifact 或未支持 CUDA 版本不属于本项目的支持配置。
