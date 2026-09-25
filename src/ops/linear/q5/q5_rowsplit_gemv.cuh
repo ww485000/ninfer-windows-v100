@@ -101,10 +101,17 @@ struct Q5GemvStoreEpilogue {
     }
 };
 
-template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kSplitOutput = false,
-          int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue, bool TriggerPdl = false,
-          bool JoinPdl = false>
-__global__ void
+template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kResidual,
+          bool kSplitOutput = false, int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue,
+          bool TriggerPdl = false, bool JoinPdl = false>
+__global__
+#ifdef NINFER_VOLTA_BUILD
+// The launch bound holds decode-shaped instantiations below the register threshold that would
+// exclude a fourth resident block. Shared-memory-heavy instantiations remain limited by their
+// staging buffer, so the same bound is safe across the template family.
+__launch_bounds__(kRowsPerBlock * 32, 2048 / (kRowsPerBlock * 32))
+#endif
+void
 q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                         const std::uint8_t* __restrict__ high_bits,
                         const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
@@ -122,6 +129,7 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     static_assert(kStages >= 2, "need at least double buffering");
     static_assert(!kSplitOutput || (kSplitRow > 0 && kSplitRow < kN),
                   "split-output Q5 GEMV requires an interior compile-time seam");
+    static_assert(!kResidual || !kSplitOutput, "the Q5 residual GEMV epilogue is contiguous-only");
 
     if constexpr (TriggerPdl) {
         if (threadIdx.x == 0) { pdl::trigger_dependents(); }
@@ -189,11 +197,32 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     }
 
     acc = warp_reduce_sum(acc);
+    if constexpr (kResidual) {
+        if (lane == 0) { acc = __bfloat162float(out[row]) + acc; }
+    }
     if (lane == 0) {
         epilogue.template operator()<kSplitOutput, kSplitRow>(out, out_tail, row, acc);
     }
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
+
+#ifdef NINFER_VOLTA_BUILD
+// ncu measured this kernel family's default shared-memory carveout at 65.54KB/SM (not the full
+// 96KB Volta permits), which -- combined with the register fix above -- still caps occupancy at
+// 3 blocks/SM by shared memory (65.54KB / ~21.5KB per block) even after registers stop being the
+// limiter. cudaFuncAttributePreferredSharedMemoryCarveout=100 asks the driver to favor shared
+// memory over L1 for this specific kernel; done once per instantiation (static local, so each
+// distinct template instantiation gets its own one-time call) since this is a driver call, not
+// free to repeat every decode step.
+template <typename KernelPtr>
+inline void q5_rowsplit_gemv_request_max_shared_carveout(KernelPtr kernel) {
+    static bool done = [&] {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        return true;
+    }();
+    (void)done;
+}
+#endif
 
 // One block per kRowsPerBlock rows; kRowsPerBlock warps per block.
 template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
@@ -203,8 +232,28 @@ inline void q5_rowsplit_gemv_launch_kernel(const __nv_bfloat16* x, const std::ui
                                            cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
-    q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX>
+#ifdef NINFER_VOLTA_BUILD
+    q5_rowsplit_gemv_request_max_shared_carveout(
+        q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>);
+#endif
+    q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, out, nullptr);
 }
+
+template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
+inline void
+q5_rowsplit_gemv_residual_launch_kernel(const __nv_bfloat16* x, const std::uint8_t* codes,
+                                        const std::uint8_t* high_bits, const std::uint8_t* scales,
+                                        __nv_bfloat16* residual_out, cudaStream_t stream) {
+    constexpr int kBlockThreads = kRowsPerBlock * 32;
+    const int grid              = kN / kRowsPerBlock;
+#ifdef NINFER_VOLTA_BUILD
+    q5_rowsplit_gemv_request_max_shared_carveout(
+        q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>);
+#endif
+    q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>
+        <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual_out, nullptr);
+}
+
 
 } // namespace ninfer::ops::detail

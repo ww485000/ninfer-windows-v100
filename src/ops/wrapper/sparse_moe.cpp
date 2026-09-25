@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/nvtx.h"
@@ -79,7 +78,7 @@ void require_matrix_metadata(const Weight& weight, std::int32_t n, std::int32_t 
 void require_router(const Weight& weight, std::vector<AddressRange>& ranges) {
     require_matrix_metadata(weight, kRouterRows, kHidden, "router_shared_gate");
     const std::size_t bytes = static_cast<std::size_t>(kRouterRows) * kHidden * 2;
-    if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
+    if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous ||
         weight.qdata == nullptr || weight.qhigh != nullptr || weight.scales != nullptr ||
         weight.payload_bytes < bytes || !aligned_to(weight.qdata, 16)) {
         throw std::invalid_argument(
@@ -96,13 +95,13 @@ struct QuantGeometry {
 
 QuantGeometry quant_geometry(QType qtype) {
     switch (qtype) {
-    case QType::Q4_G64_FP16:
+    case QType::Q4G64_F16S:
         return {64, 32, 0};
-    case QType::Q5_G64_FP16:
+    case QType::Q5G64_F16S:
         return {64, 32, 8};
-    case QType::Q6_G64_FP16:
+    case QType::Q6G64_F16S:
         return {64, 32, 16};
-    case QType::Q8_G32_FP16:
+    case QType::W8G32_F16S:
         return {32, 32, 0};
     default:
         throw std::invalid_argument("sparse_moe: unsupported quantized weight format");
@@ -139,24 +138,31 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
 
 void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, ranges);
-    if (weights.routed_gate_up.qtype != QType::Q4_G64_FP16 &&
-        weights.routed_gate_up.qtype != QType::Q8_G32_FP16) {
-        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or Q8");
+    if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
+        weights.routed_gate_up.qtype != QType::W8G32_F16S) {
+        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or W8");
     }
-    if (weights.routed_down.qtype != QType::Q5_G64_FP16 &&
-        weights.routed_down.qtype != QType::Q6_G64_FP16 &&
-        weights.routed_down.qtype != QType::Q8_G32_FP16) {
-        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or Q8");
+    if (weights.routed_down.qtype != QType::Q5G64_F16S &&
+        weights.routed_down.qtype != QType::Q6G64_F16S &&
+        weights.routed_down.qtype != QType::W8G32_F16S) {
+        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or W8");
     }
-    if (weights.shared_gate_up.qtype != QType::Q8_G32_FP16 ||
-        weights.shared_down.qtype != QType::Q8_G32_FP16) {
-        throw std::invalid_argument("sparse_moe: shared weights must be Q8");
+    if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
+        weights.shared_down.qtype != QType::W8G32_F16S) {
+        throw std::invalid_argument("sparse_moe: shared weights must be W8");
     }
     require_quantized(weights.routed_gate_up, kRoutedGateRows, kHidden, "routed_gate_up", ranges);
     require_quantized(weights.routed_down, kRoutedDownRows, kIntermediate, "routed_down", ranges);
     require_quantized(weights.shared_gate_up, kSharedGateRows, kHidden, "shared_gate_up", ranges);
     require_quantized(weights.shared_down, kHidden, kIntermediate, "shared_down", ranges);
 }
+
+#ifdef NINFER_VOLTA_BUILD
+bool volta_prefill_supported(QType routed_gate_up, QType routed_down) noexcept {
+    return routed_gate_up == QType::Q4G64_F16S &&
+           (routed_down == QType::Q5G64_F16S || routed_down == QType::Q6G64_F16S);
+}
+#endif // NINFER_VOLTA_BUILD
 
 } // namespace
 
@@ -167,38 +173,48 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
     }
     (void)detail::resolve_sparse_moe_decode_plan(routed_gate_up, routed_down);
 
-    const bool q8_profile =
-        routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
+    const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
     const std::int32_t prefill_first =
-        q8_profile ? detail::kSparseMoePrefillQ8Q8Min
-                   : (routed_down == QType::Q5_G64_FP16 ? detail::kSparseMoePrefillQ4Q5Min
-                                                        : detail::kSparseMoePrefillQ4Q6Min);
+        w8_profile ? detail::kSparseMoePrefillW8W8Min
+                   : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
+                                                       : detail::kSparseMoePrefillQ4Q6Min);
 
     std::size_t required = 0;
     if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(); }
 
     const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t small_last = std::min(max_tokens, detail::kSparseMoeSmallTMax);
+#else
     const std::int32_t small_last =
         std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
+#endif // NINFER_VOLTA_BUILD
     if (small_first <= small_last) {
         required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(small_last));
     }
 
+#ifdef NINFER_VOLTA_BUILD
+    if (max_tokens > detail::kSparseMoeSmallTMax) {
+        required = std::max(required,
+                            detail::sparse_moe_small_t_workspace_bytes(detail::kSparseMoeSmallTMax));
+    }
+    const std::int32_t volta_prefill_first = std::max(min_tokens, prefill_first);
+    if (volta_prefill_supported(routed_gate_up, routed_down) &&
+        volta_prefill_first <= max_tokens) {
+        required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens));
+    }
+    return required;
+#else
     const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
     if (prefill_interval_first <= max_tokens) {
         required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens));
     }
     return required;
+#endif // NINFER_VOLTA_BUILD
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
-    sparse_moe(x, weights, epilogue, destination, SparseMoeHints{}, workspace, stream);
-}
-
-void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
-                cudaStream_t stream) {
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
     }
@@ -214,14 +230,28 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     validate_weights(weights, ranges);
 
     const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
+#ifdef NINFER_VOLTA_BUILD
+    const bool use_prefill = volta_prefill_supported(weights.routed_gate_up.qtype,
+                                                      weights.routed_down.qtype) &&
+                             detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
+                                                             weights.routed_down.qtype);
+    const bool use_chunked = !use_prefill && tokens > detail::kSparseMoeSmallTMax;
+#else
     const bool use_prefill = detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
                                                              weights.routed_down.qtype);
+    constexpr bool use_chunked = false;
+#endif // NINFER_VOLTA_BUILD
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,
                                 nvtx::Category::Moe, static_cast<std::uint64_t>(tokens));
     std::size_t required = 0;
-    if (use_prefill) {
+    if (use_chunked) {
+        required = detail::resolve_sparse_moe_small_t_plan(detail::kSparseMoeSmallTMax,
+                                                           weights.routed_gate_up.qtype,
+                                                           weights.routed_down.qtype)
+                       .workspace_bytes;
+    } else if (use_prefill) {
         required = detail::resolve_sparse_moe_prefill_plan(tokens, weights.routed_gate_up.qtype,
                                                            weights.routed_down.qtype)
                        .workspace_bytes;
@@ -242,6 +272,33 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     require_disjoint(ranges);
 
     auto scope = workspace.scope();
+    if (use_chunked) {
+        // Exact, not an approximation: every token column is independent, so the
+        // partition is invisible to the result. Chunk width is the small-T
+        // kernel's compile-time instantiation ceiling, not a tuning choice.
+        for (std::int32_t begin = 0; begin < tokens; begin += detail::kSparseMoeSmallTMax) {
+            const std::int32_t count = std::min(detail::kSparseMoeSmallTMax, tokens - begin);
+            auto chunk_scope         = workspace.scope();
+            const Tensor x_chunk     = x.slice(1, begin, count);
+            Tensor destination_chunk = destination.slice(1, begin, count);
+
+            if (count >= detail::kSparseMoeSmallTMin) {
+                const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
+                    count, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+                const detail::SparseMoeSmallTWorkspace views =
+                    detail::allocate_sparse_moe_small_t_workspace(workspace, count);
+                detail::sparse_moe_small_t_launch(x_chunk, weights, destination_chunk, plan, views,
+                                                  stream);
+            } else {
+                const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
+                    weights.routed_gate_up.qtype, weights.routed_down.qtype);
+                const detail::SparseMoeDecodeWorkspace views =
+                    detail::allocate_sparse_moe_decode_workspace(workspace);
+                detail::sparse_moe_decode_launch(x_chunk, weights, destination_chunk, views, stream);
+            }
+        }
+        return;
+    }
     if (use_prefill) {
         const detail::SparseMoePrefillPlan plan = detail::resolve_sparse_moe_prefill_plan(
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
@@ -260,15 +317,23 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     }
 
     const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
-        weights.routed_gate_up.qtype, weights.routed_down.qtype, hints);
+        weights.routed_gate_up.qtype, weights.routed_down.qtype);
     const detail::SparseMoeDecodeWorkspace views =
         detail::allocate_sparse_moe_decode_workspace(workspace);
     for (std::int32_t token = 0; token < tokens; ++token) {
         const Tensor x_column     = x.slice(1, token, 1);
         Tensor destination_column = destination.slice(1, token, 1);
-        detail::sparse_moe_decode_launch(x_column, weights, destination_column, plan, views,
-                                         stream);
+        detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream);
     }
+}
+
+// SparseMoeHints are pure L2-prefetch hints with no numeric effect (see the contract header); the
+// sm_70 kernels do not consume them, so forward to the plain overload.
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
+                cudaStream_t stream) {
+    (void)hints;
+    sparse_moe(x, weights, epilogue, destination, workspace, stream);
 }
 
 } // namespace ninfer::ops

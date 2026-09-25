@@ -75,10 +75,6 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
 
     void register_routes();
-    void mount_webui(const std::string& webui_dir);
-    void register_webui_mime();
-    [[nodiscard]] bool webui_spa_path(const std::string& path) const;
-    [[nodiscard]] bool is_api_path(const std::string& path) const;
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
@@ -91,7 +87,6 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
-    void handle_props(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
     void record_request_rejected(const RequestRejectionLogContext& context);
@@ -101,14 +96,10 @@ private:
     void record_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
-    void log_line(const std::string& line);
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
-    bool webui_serving_ = false;         // true once a static webui dir is mounted
-    std::string webui_index_html_;       // cached index.html for the SPA fallback
-    std::shared_ptr<spdlog::logger> logger_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;

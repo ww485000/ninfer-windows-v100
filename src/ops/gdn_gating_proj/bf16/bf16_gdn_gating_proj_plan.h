@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/weight.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
@@ -39,7 +38,6 @@ struct Bf16GdnGatingPlan {
 };
 
 enum class Bf16GdnNormGatingScheduleId {
-    FusedSimt27,
     Composed,
     MmaCooperativeSplit32,
 };

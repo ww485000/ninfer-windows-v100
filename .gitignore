@@ -21,7 +21,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
-.venv-*/
 venv/
 *.egg-info/
 
@@ -34,8 +33,6 @@ venv/
 *.ninfer.conversion.json
 /models/
 out/
-models/
-vcpkg_installed/
 
 # Local workspace and transient runtime output
 /.local/
@@ -62,11 +59,6 @@ tools/freq_corpus/fixtures/*
 .DS_Store
 profiles/
 .chatgpt/
-benchmark_results/
-
-# Local release products. Keep the publishing guide, upload archives as GitHub Release assets.
-dist/*
-!dist/README.md
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json

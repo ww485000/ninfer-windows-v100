@@ -1,4 +1,4 @@
-#include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "targets/qwen3_6/impl/frontend/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
 
@@ -14,7 +14,7 @@
 namespace {
 
 using Json   = nlohmann::json;
-namespace fi = ninfer::models::qwen3_5::frontend;
+namespace fi = ninfer::targets::qwen3_6::frontend_internal;
 
 const fi::ToolCallOutputContract kLegacyContract;
 

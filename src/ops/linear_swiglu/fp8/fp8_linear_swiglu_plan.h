@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
@@ -22,6 +21,15 @@ void fp8_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Ten
                                       cudaStream_t stream);
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream);
+
+#ifdef NINFER_VOLTA_BUILD
+void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                        float* gate_scratch, float* up_scratch,
+                                        void* activation_scratch,
+                                        cudaStream_t stream);
+[[nodiscard]] bool fp8_linear_swiglu_qpn_split_supported(std::int32_t k,
+                                                          std::int32_t t) noexcept;
+#endif
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,

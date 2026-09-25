@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include "core/device.h"
@@ -7,6 +6,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
+#include "ops/linear/w8/w8_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
@@ -216,7 +216,6 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
         scan[expert] += add;
         __syncthreads();
     }
-    const int touched   = __syncthreads_count(count > 0);
     const int job_begin = expert == 0 ? 0 : scan[expert - 1];
     const int jobs      = (count + job_bn - 1) / job_bn;
     for (int job = 0; job < jobs; ++job) {
@@ -226,16 +225,15 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
     if (expert == kExperts - 1) {
         const int jobs = scan[expert];
         // Above 3.5 grouped jobs per token, fixed token work wins by avoiding sparse expert tiles.
-        route_job_count[0] = adaptive && jobs * 2 > 7 * tokens ? -jobs : jobs;
-        route_job_count[1] = touched;
+        *route_job_count = adaptive && jobs * 2 > 7 * tokens ? -jobs : jobs;
     }
 }
 
 template <bool Adaptive>
 __global__ void
 sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
-                                 const int* __restrict__ local_rank, int* __restrict__ packed_index,
-                                 const int* __restrict__ tile_bases,
+                                 const int* __restrict__ local_rank,
+                                 int* __restrict__ packed_index, const int* __restrict__ tile_bases,
                                  __nv_bfloat16* __restrict__ gathered,
                                  const int* __restrict__ route_job_count) {
     if constexpr (Adaptive) {
@@ -277,57 +275,23 @@ sparse_moe_prefill_index_kernel(const int* __restrict__ ids, const int* __restri
     packed_token[packed]     = token;
 }
 
-constexpr int kExpertBM     = 64;
-constexpr int kExpertBN     = 64;
-constexpr int kExpertBK     = 64;
-constexpr int kExpertStages = 2;
-// The narrow routed gate/up walks 32 k-tiles per job and stages a 32-column B tile, so six
-// stages still fit the 48 KiB static shared limit (49 152 B exactly). The routed down walks
-// 8 tiles and the wide plan stages 64 columns; neither has room or reason for more, so both
-// keep the two-stage default.
-constexpr int kGateUpNarrowStages = 6;
-constexpr int kExpertWarps        = 8;
-constexpr int kExpertThreads      = 32 * kExpertWarps;
-constexpr int kRtx5090SmCount     = 170;
-// Upper bound on the persistent grid. The routed GEMMs stride their work list by gridDim.x,
-// so any grid is correct; this caps the launch when the work list is long.
-constexpr int kPrefillMaxBlocksPerSm = 32;
-constexpr int kPrefillMaxBlocks      = kPrefillMaxBlocksPerSm * kRtx5090SmCount;
+constexpr int kExpertBM                = 64;
+constexpr int kExpertBN                = 64;
+constexpr int kExpertBK                = 64;
+constexpr int kExpertStages            = 2;
+constexpr int kExpertWarps             = 8;
+constexpr int kExpertThreads           = 32 * kExpertWarps;
+constexpr int kRtx5090SmCount          = 170;
+constexpr int kPrefillBlocksPerSm      = 3;
+constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
 
-// The narrow routed gate/up ships in both depths and the route picks one. A job is one nonempty
-// column tile of one expert, so more than one job per touched expert means an expert's rows
-// outgrow a tile and its neighbouring jobs re-read the weights it already pulled in. Those reads
-// hit L2, there is no latency left to hide, and the deep pipeline is left paying its 24 KiB of
-// extra shared memory, which cuts the blocks resident on an SM from three to two. Both counts
-// are built on the device by the scan, so the choice is made there: both shapes are launched
-// over the same work list and each leaves at once unless the route picked it. The adaptive path
-// below already dispatches off this same counter.
-enum class GateUpRoute { Any, Spread, Packed };
-// Where the two depths swap is measured, and it is measured on the server rather than on the
-// operator fixture, because the two disagree by about six times. A round-robin fixture that
-// walks the ratio continuously from 1.0 to 2.0 puts the crossing at 1.56 to 1.58 with a warm
-// L2 and at 1.68 to 1.95 with a cold one, over expert counts 64, 96, 128 and 176. The server
-// sits on the cold side: sweeping the threshold through the product at 1.5, 1.5625, 1.625,
-// 1.75 and 2.0, prefill is fastest at 7/4, and the two warm-cache candidates are the worst of
-// the five. Against 2/1 the move is worth 0.10 to 0.17 points of server prefill on prompts below
-// the wide-plan bound, over two four-pass runs, against +0.01 to +0.02 above it, which is the
-// null control the same runs carry.
-constexpr int kGateUpDeepJobsNum = 7;
-constexpr int kGateUpDeepJobsDen = 4;
-
-template <int ExpertWarps, int ExpertBN, int Stages = kExpertStages,
-          GateUpRoute Route = GateUpRoute::Any>
+template <int ExpertWarps, int ExpertBN>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
     const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
     const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ activation) {
-    if constexpr (Route != GateUpRoute::Any) {
-        const bool spread =
-            route_job_count[0] * kGateUpDeepJobsDen < kGateUpDeepJobsNum * route_job_count[1];
-        if (spread != (Route == GateUpRoute::Spread)) { return; }
-    }
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = kHidden / 64;
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
@@ -338,8 +302,8 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
     static_assert(StageIters * ExpertThreads == ExpertBN * StageChunks,
                   "the staging loop is unrolled, so every thread must take the same column count");
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
-    __shared__ __align__(16) __nv_bfloat16 Bs[Stages][ExpertBN * kExpertBK];
-    __shared__ __align__(16) std::uint8_t Cr[Stages][kExpertBM * 32];
+    __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
+    __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * 32];
     __shared__ __align__(16) std::uint8_t Sr[kExpertBM * GroupsPerRow * 2];
 
     const int tid  = static_cast<int>(threadIdx.x);
@@ -438,15 +402,15 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
         stage_scales();
         cp_commit();
 #pragma unroll
-        for (int stage = 0; stage < Stages; ++stage) {
+        for (int stage = 0; stage < kExpertStages; ++stage) {
             stage_inputs(stage, stage);
             cp_commit();
         }
 
 #pragma unroll 1
         for (int kt = 0; kt < kHidden / kExpertBK; ++kt) {
-            const int stage = kt % Stages;
-            cp_wait<Stages - 1>();
+            const int stage = kt & 1;
+            cp_wait<kExpertStages - 1>();
             __syncthreads();
             decode_weight(stage);
             __syncthreads();
@@ -506,7 +470,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
             }
 
             __syncthreads();
-            const int next = kt + Stages;
+            const int next = kt + kExpertStages;
             if (next < kHidden / kExpertBK) { stage_inputs(stage, next); }
             cp_commit();
         }
@@ -544,7 +508,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
 }
 
 template <bool Routed, bool Adaptive = false>
-__global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_up_kernel(
+__global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_up_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ activation, int tokens, const int* __restrict__ route_job_count) {
@@ -933,7 +897,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
 }
 
 template <bool Routed, bool Adaptive = false>
-__global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_kernel(
+__global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ grouped_output, const float* __restrict__ routed_sum,
@@ -1135,6 +1099,563 @@ union alignas(16) SparseMoeBf16x8 {
     __nv_bfloat162 pair[4];
 };
 
+
+#ifdef NINFER_VOLTA_BUILD
+// ---------------------------------------------------------------------------
+// Volta: weight-stationary grouped expert GEMMs.
+//
+// The mma expert kernels above trap below sm_80, and the decode path's
+// dot_two_rows primitive cannot substitute for them: it is warp-level over one
+// activation vector, so it re-reads an expert's weights once per token. That is
+// exactly the cost being removed -- measured at 47.6% (gate/up) and 26.8% (down)
+// of a3b prefill, running at ~425 GB/s against a 728 GB/s ceiling because the
+// bytes are expert weights re-read per token (on V100).
+//
+// These kernels are weight-stationary instead: one row tile's decoded weights are
+// staged in shared memory and swept against a column tile of the *grouped* token
+// buffer, so each expert's codes are read once per (row tile, column tile) rather
+// than once per token. They reuse the existing routing, scan, gather and reduce
+// scaffolding unchanged, including the device-side job list, which is what makes
+// per-expert work possible without a host sync.
+// ---------------------------------------------------------------------------
+
+constexpr int kSimtThreads     = 256;
+constexpr int kSimtWarps       = kSimtThreads / 32;
+constexpr int kSimtRowsPerCta  = 32;
+constexpr int kSimtTileK       = 64; // one Q4/Q5/Q6 group
+constexpr int kSimtPad         = 8;  // breaks the shared-memory bank conflict on As
+
+__device__ __forceinline__ void simt_decode_q4_row(const std::uint8_t* __restrict__ codes,
+                                                   const std::uint8_t* __restrict__ scales,
+                                                   std::int64_t row, int group, int chunk,
+                                                   float (&w)[8]) {
+    constexpr int kGroupsPerRow    = kHidden / Q4RowSplitStorage::kGroupK;
+    const std::int64_t group_index = row * kGroupsPerRow + group;
+    const std::uint32_t packed     = *reinterpret_cast<const std::uint32_t*>(
+        codes + group_index * Q4RowSplitStorage::kCodeBytesPerGroup + chunk * 4);
+    const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+        scales + group_index * Q4RowSplitStorage::kScaleBytesPerGroup);
+    Q4SimtDecodeAtom::decode_eight(packed, scale_bits, w);
+}
+
+// gate/up: W [expert_rows, kHidden] Q4 -> activation[slot*kIntermediate + row]
+// with the SwiGLU epilogue fused, matching the mma kernel's semantics exactly.
+template <int BN>
+__global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_q4_gate_up_simt_kernel(
+    const __nv_bfloat16* __restrict__ gathered, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ activation) {
+    constexpr int kRowsPerWarp  = kSimtRowsPerCta / kSimtWarps; // 4
+    constexpr int kColsPerLane  = BN / 32;
+    constexpr int kGroupsPerRow = kHidden / kSimtTileK;
+    constexpr int kExpertRows   = 2 * kIntermediate;
+    constexpr int kRowBlocks    = kIntermediate / kSimtRowsPerCta;
+    static_assert(BN % 32 == 0 && kIntermediate % kSimtRowsPerCta == 0);
+
+    __shared__ __align__(16) __nv_bfloat16 As[BN][kSimtTileK + kSimtPad];
+    __shared__ float Wg[kSimtRowsPerCta][kSimtTileK];
+    __shared__ float Wu[kSimtRowsPerCta][kSimtTileK];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int total_work = *route_job_count * kRowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / kRowBlocks;
+        const int row_block   = work - route_job * kRowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int row0        = row_block * kSimtRowsPerCta;
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = min(count - column_base, BN);
+        if (cols <= 0) { continue; }
+
+        float acc_g[kRowsPerWarp][kColsPerLane] = {};
+        float acc_u[kRowsPerWarp][kColsPerLane] = {};
+
+        for (int group = 0; group < kGroupsPerRow; ++group) {
+            __syncthreads();
+            // Activations: BN columns x kSimtTileK, zero-filled past `cols` so the
+            // tail tile contributes nothing rather than reading a neighbour's slot.
+            for (int idx = tid; idx < BN * (kSimtTileK / 8); idx += kSimtThreads) {
+                const int c  = idx / (kSimtTileK / 8);
+                const int kk = (idx % (kSimtTileK / 8)) * 8;
+                if (c < cols) {
+                    const std::int64_t slot = begin + column_base + c;
+                    store_vec(&As[c][kk], load_vec<uint4>(gathered + slot * kHidden +
+                                                          group * kSimtTileK + kk));
+                } else {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) { As[c][kk + e] = __float2bfloat16(0.0f); }
+                }
+            }
+            // Weights: the block's 32 rows, gate and up, decoded once per tile.
+            for (int idx = tid; idx < kSimtRowsPerCta * 2 * (kSimtTileK / 8); idx += kSimtThreads) {
+                const int chunk     = idx % (kSimtTileK / 8);
+                const int gu        = (idx / (kSimtTileK / 8)) % 2;
+                const int row_local = idx / ((kSimtTileK / 8) * 2);
+                const std::int64_t row = static_cast<std::int64_t>(expert) * kExpertRows +
+                                         (gu != 0 ? kIntermediate : 0) + row0 + row_local;
+                float w[8];
+                simt_decode_q4_row(codes, scales, row, group, chunk, w);
+                float* dst = gu != 0 ? &Wu[row_local][chunk * 8] : &Wg[row_local][chunk * 8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { dst[e] = w[e]; }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                const int row_local = warp * kRowsPerWarp + r;
+#pragma unroll
+                for (int c = 0; c < kColsPerLane; ++c) {
+                    const int col = lane * kColsPerLane + c;
+                    float g_sum   = 0.0f;
+                    float u_sum   = 0.0f;
+                    for (int k = 0; k < kSimtTileK; ++k) {
+                        const float a = __bfloat162float(As[col][k]);
+                        g_sum         = fmaf(Wg[row_local][k], a, g_sum);
+                        u_sum         = fmaf(Wu[row_local][k], a, u_sum);
+                    }
+                    acc_g[r][c] += g_sum;
+                    acc_u[r][c] += u_sum;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            const int row = row0 + warp * kRowsPerWarp + r;
+#pragma unroll
+            for (int c = 0; c < kColsPerLane; ++c) {
+                const int local_col = lane * kColsPerLane + c;
+                if (local_col >= cols) { continue; }
+                const std::int64_t slot = begin + column_base + local_col;
+                activation[slot * kIntermediate + row] =
+                    __float2bfloat16_rn(silu(acc_g[r][c]) * acc_u[r][c]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// down: W [kHidden, kIntermediate] per expert -> output[slot*kHidden + row].
+// The routing weight (alpha) is applied by the reduce kernel, not here, matching
+// the mma kernel this replaces.
+struct SimtQ5Decode {
+    using Storage = Q5RowSplitStorage;
+    __device__ static __forceinline__ void load_eight(const std::uint8_t* codes,
+                                                      const std::uint8_t* high,
+                                                      const std::uint8_t* scales,
+                                                      std::int64_t group_index, int chunk,
+                                                      float (&w)[8]) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Storage::kCodeBytesPerGroup + chunk * 4);
+        const std::uint8_t high_bits = high[group_index * Storage::kHighBytesPerGroup + chunk];
+        const auto scale_bits        = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Storage::kScaleBytesPerGroup);
+        Q5SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, w);
+    }
+};
+
+struct SimtQ6Decode {
+    using Storage = Q6RowSplitStorage;
+    __device__ static __forceinline__ void load_eight(const std::uint8_t* codes,
+                                                      const std::uint8_t* high,
+                                                      const std::uint8_t* scales,
+                                                      std::int64_t group_index, int chunk,
+                                                      float (&w)[8]) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Storage::kCodeBytesPerGroup + chunk * 4);
+        const std::uint16_t high_bits = *reinterpret_cast<const std::uint16_t*>(
+            high + group_index * Storage::kHighBytesPerGroup + chunk * 2);
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Storage::kScaleBytesPerGroup);
+        Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, w);
+    }
+};
+
+template <class Decode, int BN>
+__global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_qx_down_simt_kernel(
+    const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output) {
+    constexpr int kRowsPerWarp  = kSimtRowsPerCta / kSimtWarps;
+    constexpr int kColsPerLane  = BN / 32;
+    constexpr int kGroupsPerRow = kIntermediate / kSimtTileK;
+    constexpr int kRowBlocks    = kHidden / kSimtRowsPerCta;
+    static_assert(BN % 32 == 0 && kHidden % kSimtRowsPerCta == 0);
+
+    __shared__ __align__(16) __nv_bfloat16 As[BN][kSimtTileK + kSimtPad];
+    __shared__ float Ws[kSimtRowsPerCta][kSimtTileK];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int total_work = *route_job_count * kRowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / kRowBlocks;
+        const int row_block   = work - route_job * kRowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int row0        = row_block * kSimtRowsPerCta;
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = min(count - column_base, BN);
+        if (cols <= 0) { continue; }
+
+        float acc[kRowsPerWarp][kColsPerLane] = {};
+
+        for (int group = 0; group < kGroupsPerRow; ++group) {
+            __syncthreads();
+            for (int idx = tid; idx < BN * (kSimtTileK / 8); idx += kSimtThreads) {
+                const int c  = idx / (kSimtTileK / 8);
+                const int kk = (idx % (kSimtTileK / 8)) * 8;
+                if (c < cols) {
+                    const std::int64_t slot = begin + column_base + c;
+                    store_vec(&As[c][kk], load_vec<uint4>(activation + slot * kIntermediate +
+                                                          group * kSimtTileK + kk));
+                } else {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) { As[c][kk + e] = __float2bfloat16(0.0f); }
+                }
+            }
+            for (int idx = tid; idx < kSimtRowsPerCta * (kSimtTileK / 8); idx += kSimtThreads) {
+                const int chunk        = idx % (kSimtTileK / 8);
+                const int row_local    = idx / (kSimtTileK / 8);
+                const std::int64_t row = static_cast<std::int64_t>(expert) * kHidden + row0 +
+                                         row_local;
+                const std::int64_t group_index = row * kGroupsPerRow + group;
+                float w[8];
+                Decode::load_eight(codes, high, scales, group_index, chunk, w);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { Ws[row_local][chunk * 8 + e] = w[e]; }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                const int row_local = warp * kRowsPerWarp + r;
+#pragma unroll
+                for (int c = 0; c < kColsPerLane; ++c) {
+                    const int col = lane * kColsPerLane + c;
+                    float sum     = 0.0f;
+                    for (int k = 0; k < kSimtTileK; ++k) {
+                        sum = fmaf(Ws[row_local][k], __bfloat162float(As[col][k]), sum);
+                    }
+                    acc[r][c] += sum;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            const int row = row0 + warp * kRowsPerWarp + r;
+#pragma unroll
+            for (int c = 0; c < kColsPerLane; ++c) {
+                const int local_col = lane * kColsPerLane + c;
+                if (local_col >= cols) { continue; }
+                const std::int64_t slot = begin + column_base + local_col;
+                output[slot * kHidden + row] = __float2bfloat16_rn(acc[r][c]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+
+// Router: scores [kRouterRows, tokens] = router [kRouterRows, kHidden] x x.
+// Same weight-stationary shape as the expert kernels so the router weight is read
+// once per token tile rather than once per token. kRouterRows is 257, which is not
+// a multiple of the row tile, so the tail row block is guarded.
+template <int BN>
+__global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_router_simt_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ router,
+    float* __restrict__ scores, int tokens) {
+    constexpr int kRowsPerWarp  = kSimtRowsPerCta / kSimtWarps;
+    constexpr int kColsPerLane  = BN / 32;
+    constexpr int kGroupsPerRow = kHidden / kSimtTileK;
+    static_assert(BN % 32 == 0);
+
+    __shared__ __align__(16) __nv_bfloat16 As[BN][kSimtTileK + kSimtPad];
+    __shared__ __align__(16) __nv_bfloat16 Ws[kSimtRowsPerCta][kSimtTileK];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int row0        = static_cast<int>(blockIdx.x) * kSimtRowsPerCta;
+    const int column_base = static_cast<int>(blockIdx.y) * BN;
+    const int cols        = min(tokens - column_base, BN);
+    if (cols <= 0) { return; }
+
+    float acc[kRowsPerWarp][kColsPerLane] = {};
+
+    for (int group = 0; group < kGroupsPerRow; ++group) {
+        __syncthreads();
+        for (int idx = tid; idx < BN * (kSimtTileK / 8); idx += kSimtThreads) {
+            const int c  = idx / (kSimtTileK / 8);
+            const int kk = (idx % (kSimtTileK / 8)) * 8;
+            if (c < cols) {
+                store_vec(&As[c][kk],
+                          load_vec<uint4>(x + static_cast<std::int64_t>(column_base + c) * kHidden +
+                                          group * kSimtTileK + kk));
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { As[c][kk + e] = __float2bfloat16(0.0f); }
+            }
+        }
+        for (int idx = tid; idx < kSimtRowsPerCta * (kSimtTileK / 8); idx += kSimtThreads) {
+            const int chunk     = idx % (kSimtTileK / 8);
+            const int row_local = idx / (kSimtTileK / 8);
+            const int row       = row0 + row_local;
+            if (row < kRouterRows) {
+                store_vec(&Ws[row_local][chunk * 8],
+                          load_vec<uint4>(router + static_cast<std::int64_t>(row) * kHidden +
+                                          group * kSimtTileK + chunk * 8));
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { Ws[row_local][chunk * 8 + e] = __float2bfloat16(0.0f); }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            const int row_local = warp * kRowsPerWarp + r;
+#pragma unroll
+            for (int c = 0; c < kColsPerLane; ++c) {
+                const int col = lane * kColsPerLane + c;
+                float sum     = 0.0f;
+                for (int k = 0; k < kSimtTileK; ++k) {
+                    sum = fmaf(__bfloat162float(Ws[row_local][k]),
+                               __bfloat162float(As[col][k]), sum);
+                }
+                acc[r][c] += sum;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        const int row = row0 + warp * kRowsPerWarp + r;
+        if (row >= kRouterRows) { continue; }
+#pragma unroll
+        for (int c = 0; c < kColsPerLane; ++c) {
+            const int local_col = lane * kColsPerLane + c;
+            if (local_col >= cols) { continue; }
+            // Row stride is the padded kSparseMoeRouterScoreRows (260), not kRouterRows
+            // (257); the mma kernel this replaces uses the same padded stride.
+            scores[static_cast<std::int64_t>(column_base + local_col) *
+                       kSparseMoeRouterScoreRows +
+                   row] = acc[r][c];
+        }
+    }
+}
+
+
+// W8 rowsplit: one int8 code per element with a row's codes contiguous
+// (kCodeBytesPerGroup == kGroupK), one FP16 scale per 32-element group.
+__device__ __forceinline__ void simt_decode_w8_row(const std::uint8_t* __restrict__ codes,
+                                                   const std::uint8_t* __restrict__ scales,
+                                                   std::int64_t row, int K, int k0,
+                                                   float (&w)[8]) {
+    const int groups_per_row       = K / W8RowSplitStorage::kGroupK;
+    const std::int64_t group_index = row * groups_per_row + k0 / W8RowSplitStorage::kGroupK;
+    const float scale              = __half2float(__ushort_as_half(
+        *reinterpret_cast<const std::uint16_t*>(
+                         scales + group_index * W8RowSplitStorage::kScaleBytesPerGroup)));
+    const auto* c = reinterpret_cast<const std::int8_t*>(codes) + row * K + k0;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) { w[e] = static_cast<float>(c[e]) * scale; }
+}
+
+// Shared expert gate/up. Dense over every token -- the shared weights are already
+// amortized, so this needs no grouping, only a Volta-capable implementation.
+template <int BN, bool Adaptive>
+__global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_w8_shared_gate_up_simt_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ activation, int tokens,
+    const int* __restrict__ route_job_count) {
+    if constexpr (Adaptive) {
+        if (*route_job_count < 0) { return; }
+    }
+    constexpr int kRowsPerWarp = kSimtRowsPerCta / kSimtWarps;
+    constexpr int kColsPerLane = BN / 32;
+    constexpr int kTiles       = kHidden / kSimtTileK;
+
+    __shared__ __align__(16) __nv_bfloat16 As[BN][kSimtTileK + kSimtPad];
+    __shared__ float Wg[kSimtRowsPerCta][kSimtTileK];
+    __shared__ float Wu[kSimtRowsPerCta][kSimtTileK];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int row0        = static_cast<int>(blockIdx.x) * kSimtRowsPerCta;
+    const int column_base = static_cast<int>(blockIdx.y) * BN;
+    const int cols        = min(tokens - column_base, BN);
+    if (cols <= 0) { return; }
+
+    float acc_g[kRowsPerWarp][kColsPerLane] = {};
+    float acc_u[kRowsPerWarp][kColsPerLane] = {};
+
+    for (int tile = 0; tile < kTiles; ++tile) {
+        const int k0 = tile * kSimtTileK;
+        __syncthreads();
+        for (int idx = tid; idx < BN * (kSimtTileK / 8); idx += kSimtThreads) {
+            const int c  = idx / (kSimtTileK / 8);
+            const int kk = (idx % (kSimtTileK / 8)) * 8;
+            if (c < cols) {
+                store_vec(&As[c][kk],
+                          load_vec<uint4>(x + static_cast<std::int64_t>(column_base + c) * kHidden +
+                                          k0 + kk));
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { As[c][kk + e] = __float2bfloat16(0.0f); }
+            }
+        }
+        for (int idx = tid; idx < kSimtRowsPerCta * 2 * (kSimtTileK / 8); idx += kSimtThreads) {
+            const int chunk        = idx % (kSimtTileK / 8);
+            const int gu           = (idx / (kSimtTileK / 8)) % 2;
+            const int row_local    = idx / ((kSimtTileK / 8) * 2);
+            const std::int64_t row = (gu != 0 ? kIntermediate : 0) + row0 + row_local;
+            float w[8];
+            simt_decode_w8_row(codes, scales, row, kHidden, k0 + chunk * 8, w);
+            float* dst = gu != 0 ? &Wu[row_local][chunk * 8] : &Wg[row_local][chunk * 8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { dst[e] = w[e]; }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            const int row_local = warp * kRowsPerWarp + r;
+#pragma unroll
+            for (int c = 0; c < kColsPerLane; ++c) {
+                const int col = lane * kColsPerLane + c;
+                float g_sum   = 0.0f;
+                float u_sum   = 0.0f;
+                for (int k = 0; k < kSimtTileK; ++k) {
+                    const float a = __bfloat162float(As[col][k]);
+                    g_sum         = fmaf(Wg[row_local][k], a, g_sum);
+                    u_sum         = fmaf(Wu[row_local][k], a, u_sum);
+                }
+                acc_g[r][c] += g_sum;
+                acc_u[r][c] += u_sum;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        const int row = row0 + warp * kRowsPerWarp + r;
+#pragma unroll
+        for (int c = 0; c < kColsPerLane; ++c) {
+            const int local_col = lane * kColsPerLane + c;
+            if (local_col >= cols) { continue; }
+            const std::int64_t col = column_base + local_col;
+            activation[col * kIntermediate + row] =
+                __float2bfloat16_rn(silu(acc_g[r][c]) * acc_u[r][c]);
+        }
+    }
+}
+
+// Shared expert down, with the same fused combine the mma kernel performs:
+// destination = destination (residual) + routed_sum + shared_scale[col] * value.
+template <int BN, bool Adaptive>
+__global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_w8_shared_down_simt_kernel(
+    const __nv_bfloat16* __restrict__ activation, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, const float* __restrict__ routed_sum,
+    const float* __restrict__ shared_scale, __nv_bfloat16* __restrict__ destination, int tokens,
+    const int* __restrict__ route_job_count) {
+    if constexpr (Adaptive) {
+        if (*route_job_count < 0) { return; }
+    }
+    constexpr int kRowsPerWarp = kSimtRowsPerCta / kSimtWarps;
+    constexpr int kColsPerLane = BN / 32;
+    constexpr int kTiles       = kIntermediate / kSimtTileK;
+
+    __shared__ __align__(16) __nv_bfloat16 As[BN][kSimtTileK + kSimtPad];
+    __shared__ float Ws[kSimtRowsPerCta][kSimtTileK];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int row0        = static_cast<int>(blockIdx.x) * kSimtRowsPerCta;
+    const int column_base = static_cast<int>(blockIdx.y) * BN;
+    const int cols        = min(tokens - column_base, BN);
+    if (cols <= 0) { return; }
+
+    float acc[kRowsPerWarp][kColsPerLane] = {};
+
+    for (int tile = 0; tile < kTiles; ++tile) {
+        const int k0 = tile * kSimtTileK;
+        __syncthreads();
+        for (int idx = tid; idx < BN * (kSimtTileK / 8); idx += kSimtThreads) {
+            const int c  = idx / (kSimtTileK / 8);
+            const int kk = (idx % (kSimtTileK / 8)) * 8;
+            if (c < cols) {
+                store_vec(&As[c][kk], load_vec<uint4>(activation +
+                                                      static_cast<std::int64_t>(column_base + c) *
+                                                          kIntermediate +
+                                                      k0 + kk));
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { As[c][kk + e] = __float2bfloat16(0.0f); }
+            }
+        }
+        for (int idx = tid; idx < kSimtRowsPerCta * (kSimtTileK / 8); idx += kSimtThreads) {
+            const int chunk     = idx % (kSimtTileK / 8);
+            const int row_local = idx / (kSimtTileK / 8);
+            float w[8];
+            simt_decode_w8_row(codes, scales, row0 + row_local, kIntermediate, k0 + chunk * 8, w);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { Ws[row_local][chunk * 8 + e] = w[e]; }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            const int row_local = warp * kRowsPerWarp + r;
+#pragma unroll
+            for (int c = 0; c < kColsPerLane; ++c) {
+                const int col = lane * kColsPerLane + c;
+                float sum     = 0.0f;
+                for (int k = 0; k < kSimtTileK; ++k) {
+                    sum = fmaf(Ws[row_local][k], __bfloat162float(As[col][k]), sum);
+                }
+                acc[r][c] += sum;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        const int row = row0 + warp * kRowsPerWarp + r;
+#pragma unroll
+        for (int c = 0; c < kColsPerLane; ++c) {
+            const int local_col = lane * kColsPerLane + c;
+            if (local_col >= cols) { continue; }
+            const std::int64_t col = column_base + local_col;
+            const float merged     = __bfloat162float(destination[col * kHidden + row]) +
+                                 routed_sum[col * kHidden + row] + shared_scale[col] * acc[r][c];
+            destination[col * kHidden + row] = __float2bfloat16_rn(merged);
+        }
+    }
+}
+
+#endif // NINFER_VOLTA_BUILD
+
 template <bool Adaptive>
 __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict__ grouped_output,
                                                  const int* __restrict__ packed_index,
@@ -1209,7 +1730,9 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
     auto* scores            = static_cast<float*>(workspace.score_storage.data);
     auto* shared_activation = static_cast<__nv_bfloat16*>(workspace.shared_activation.data);
     auto* grouped_io        = static_cast<__nv_bfloat16*>(workspace.grouped_io.data);
+#ifndef NINFER_VOLTA_BUILD
     auto* packed_token      = static_cast<int*>(workspace.packed_token.data);
+#endif
     auto* routed_activation = static_cast<__nv_bfloat16*>(workspace.routed_storage.data);
     auto* routed_sum        = static_cast<float*>(workspace.routed_sum.data);
 
@@ -1223,40 +1746,64 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const int route_tiles =
             (tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
         const int assignments   = tokens * kTopK;
-        const int adaptive_last = weights.routed_down.qtype == QType::Q5_G64_FP16   ? 51
-                                  : weights.routed_down.qtype == QType::Q6_G64_FP16 ? 52
-                                                                                    : 0;
+        const int adaptive_last = weights.routed_down.qtype == QType::Q5G64_F16S   ? 51
+                                  : weights.routed_down.qtype == QType::Q6G64_F16S ? 52
+                                                                                   : 0;
         const bool adaptive     = tokens >= 47 && tokens <= adaptive_last;
 
+#ifdef NINFER_VOLTA_BUILD
+        {
+            constexpr int kSimtBN = 64;
+            const dim3 grid((kRouterRows + kSimtRowsPerCta - 1) / kSimtRowsPerCta,
+                            (tokens + kSimtBN - 1) / kSimtBN);
+            sparse_moe_prefill_router_simt_kernel<kSimtBN>
+                <<<grid, kSimtThreads, 0, stream>>>(input, router, scores, tokens);
+        }
+#else
         sparse_moe_prefill_router_mma_kernel<<<dim3((kRouterRows + kRouterBM - 1) / kRouterBM,
                                                     (tokens + kRouterBN - 1) / kRouterBN),
                                                kRouterThreads, 0, stream>>>(input, router, scores,
                                                                             tokens);
+#endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
 
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
             scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
 
-        const bool wide_plan   = tokens >= kSparseMoePrefillWideMin;
+#ifdef NINFER_VOLTA_BUILD
+        // Eight assignments over 256 experts average one packed column per 32
+        // tokens.  BN=64 therefore becomes full only around T=2048; selecting it
+        // at the Ampere-family T=768 seam makes the scalar Volta kernels spend
+        // about half their FMAs on zero-padded columns at the default T=1024
+        // prefill chunk.
+        const bool wide_plan = tokens >= 2048;
+#else
+        const bool wide_plan = tokens >= kSparseMoePrefillWideMin;
+#endif // NINFER_VOLTA_BUILD
         const int route_job_bn = wide_plan ? 64 : 32;
-        // The scan emits one route job per nonempty column tile of an expert, so it cannot
-        // emit more than one job per full tile of assignments plus one tail per expert --
-        // the same bound the workspace is sized by. Each job expands into row blocks, and
-        // sizing the grid from that product keeps a persistent block on one work item while
-        // there are fewer work items than the cap, instead of a fixed count that has to
-        // iterate. The exact job count only exists on the device.
-        const int max_route_jobs     = assignments / route_job_bn + kExperts;
-        const int routed_gate_work   = max_route_jobs * (kIntermediate / (kExpertBM / 2));
-        const int routed_down_work   = max_route_jobs * (kHidden / kExpertBM);
-        const int routed_gate_blocks = std::min(routed_gate_work, kPrefillMaxBlocks);
-        const int routed_down_blocks = std::min(routed_down_work, kPrefillMaxBlocks);
         sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
             route_tiles, route_job_bn, tokens, adaptive);
         CUDA_CHECK(cudaGetLastError());
 
-        const bool routed_gate_up_q4 = weights.routed_gate_up.qtype == QType::Q4_G64_FP16;
+#ifdef NINFER_VOLTA_BUILD
+        if (adaptive) {
+            auto* adaptive_activations = reinterpret_cast<float*>(grouped_io);
+            sparse_moe_decode_launch_d3_small_t(input_slice, weights, ids, adaptive_activations,
+                                                tokens, SparseMoeSmallTD3Schedule::Paths3, stream,
+                                                route_job_count);
+            sparse_moe_decode_launch_d4_small_t(
+                weights, output_slice, ids, alpha, shared_scale, adaptive_activations, tokens,
+                SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
+            sparse_moe_prefill_gather_kernel<true><<<assignments, kExpertThreads, 0, stream>>>(
+                input, ids, local_rank, packed_index, tile_bases, grouped_io, route_job_count);
+        } else {
+            sparse_moe_prefill_gather_kernel<false><<<assignments, kExpertThreads, 0, stream>>>(
+                input, ids, local_rank, packed_index, tile_bases, grouped_io, nullptr);
+        }
+#else
+        const bool routed_gate_up_q4 = weights.routed_gate_up.qtype == QType::Q4G64_F16S;
         const int index_blocks       = (assignments + kExpertThreads - 1) / kExpertThreads;
         if (adaptive) {
             auto* adaptive_activations = reinterpret_cast<float*>(grouped_io);
@@ -1278,86 +1825,158 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             sparse_moe_prefill_gather_kernel<false><<<assignments, kExpertThreads, 0, stream>>>(
                 input, ids, local_rank, packed_index, tile_bases, grouped_io, nullptr);
         }
+#endif
         CUDA_CHECK(cudaGetLastError());
 
+#ifdef NINFER_VOLTA_BUILD
+        // The grouped SIMT kernels take the same device-side job list and the same
+        // BN as the scan was told to use, so the column tiling matches exactly.
+        if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
+            if (wide_plan) {
+                sparse_moe_prefill_q4_gate_up_simt_kernel<64>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
+                        routed_gate_codes, routed_gate_scales, routed_activation);
+            } else {
+                sparse_moe_prefill_q4_gate_up_simt_kernel<32>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
+                        routed_gate_codes, routed_gate_scales, routed_activation);
+            }
+        } else {
+            throw std::invalid_argument(
+                "sparse_moe prefill: Volta supports only the Q4 routed gate/up codec");
+        }
+#else
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
         // Same predicate that decided whether packed_token was written above.
         if (routed_gate_up_q4) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
-                    <<<routed_gate_blocks, 8 * 32, 0, stream>>>(
+                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
             } else {
-                sparse_moe_prefill_q4_gate_up_kernel<4, 32, kExpertStages, GateUpRoute::Packed>
-                    <<<routed_gate_blocks, 4 * 32, 0, stream>>>(
-                        input, packed_token, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
-                sparse_moe_prefill_q4_gate_up_kernel<4, 32, kGateUpNarrowStages,
-                                                     GateUpRoute::Spread>
-                    <<<routed_gate_blocks, 4 * 32, 0, stream>>>(
+                sparse_moe_prefill_q4_gate_up_kernel<4, 32>
+                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
             }
-        } else if (weights.routed_gate_up.qtype == QType::Q8_G32_FP16) {
-            sparse_moe_prefill_q8_gate_up_kernel<true>
+        } else if (weights.routed_gate_up.qtype == QType::W8G32_F16S) {
+            sparse_moe_prefill_w8_gate_up_kernel<true>
                 <<<routed_gate_grid, kExpertThreads, 0, stream>>>(
                     grouped_io, offsets, routed_gate_codes, routed_gate_scales, routed_activation,
                     tokens, nullptr);
         } else {
             throw std::invalid_argument("sparse_moe prefill: unsupported gate/up codec");
         }
+#endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
                                     (tokens + kExpertBN - 1) / kExpertBN);
+#ifdef NINFER_VOLTA_BUILD
+        {
+            constexpr int kSimtBN = 64;
+            const dim3 grid(kIntermediate / kSimtRowsPerCta, (tokens + kSimtBN - 1) / kSimtBN);
+            if (adaptive) {
+                sparse_moe_prefill_w8_shared_gate_up_simt_kernel<kSimtBN, true>
+                    <<<grid, kSimtThreads, 0, stream>>>(input, shared_gate_codes,
+                                                        shared_gate_scales, shared_activation,
+                                                        tokens, route_job_count);
+            } else {
+                sparse_moe_prefill_w8_shared_gate_up_simt_kernel<kSimtBN, false>
+                    <<<grid, kSimtThreads, 0, stream>>>(input, shared_gate_codes,
+                                                        shared_gate_scales, shared_activation,
+                                                        tokens, nullptr);
+            }
+        }
+#else
         if (adaptive) {
-            sparse_moe_prefill_q8_gate_up_kernel<false, true>
+            sparse_moe_prefill_w8_gate_up_kernel<false, true>
                 <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
                     input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
                     tokens, route_job_count);
         } else {
-            sparse_moe_prefill_q8_gate_up_kernel<false, false>
+            sparse_moe_prefill_w8_gate_up_kernel<false, false>
                 <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
                     input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
                     tokens, nullptr);
         }
+#endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
 
+#ifdef NINFER_VOLTA_BUILD
+        switch (weights.routed_down.qtype) {
+        case QType::Q5G64_F16S:
+            if (wide_plan) {
+                sparse_moe_prefill_qx_down_simt_kernel<SimtQ5Decode, 64>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        routed_activation, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            } else {
+                sparse_moe_prefill_qx_down_simt_kernel<SimtQ5Decode, 32>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        routed_activation, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            }
+            break;
+        case QType::Q6G64_F16S:
+            if (wide_plan) {
+                sparse_moe_prefill_qx_down_simt_kernel<SimtQ6Decode, 64>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        routed_activation, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            } else {
+                sparse_moe_prefill_qx_down_simt_kernel<SimtQ6Decode, 32>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        routed_activation, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            }
+            break;
+        default:
+            throw std::invalid_argument(
+                "sparse_moe prefill: Volta supports only the Q5/Q6 routed down codecs");
+        }
+#else
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
         switch (weights.routed_down.qtype) {
-        case QType::Q5_G64_FP16:
+        case QType::Q5G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
+                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
-                    <<<routed_down_blocks, 4 * 32, 0, stream>>>(
+                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             }
             break;
-        case QType::Q6_G64_FP16:
+        case QType::Q6G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
+                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
-                    <<<routed_down_blocks, 4 * 32, 0, stream>>>(
+                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             }
             break;
-        case QType::Q8_G32_FP16:
-            sparse_moe_prefill_q8_down_kernel<true>
+        case QType::W8G32_F16S:
+            sparse_moe_prefill_w8_down_kernel<true>
                 <<<routed_down_grid, kExpertThreads, 0, stream>>>(
                     routed_activation, offsets, routed_down_codes, routed_down_scales, grouped_io,
                     nullptr, nullptr, nullptr, tokens, nullptr);
@@ -1365,6 +1984,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         default:
             throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
         }
+#endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
 
         if (adaptive) {
@@ -1377,17 +1997,36 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
+#ifdef NINFER_VOLTA_BUILD
+        {
+            constexpr int kSimtBN = 64;
+            const dim3 grid(kHidden / kSimtRowsPerCta, (tokens + kSimtBN - 1) / kSimtBN);
+            if (adaptive) {
+                sparse_moe_prefill_w8_shared_down_simt_kernel<kSimtBN, true>
+                    <<<grid, kSimtThreads, 0, stream>>>(shared_activation, shared_down_codes,
+                                                        shared_down_scales, routed_sum,
+                                                        shared_scale, output, tokens,
+                                                        route_job_count);
+            } else {
+                sparse_moe_prefill_w8_shared_down_simt_kernel<kSimtBN, false>
+                    <<<grid, kSimtThreads, 0, stream>>>(shared_activation, shared_down_codes,
+                                                        shared_down_scales, routed_sum,
+                                                        shared_scale, output, tokens, nullptr);
+            }
+        }
+#else
         if (adaptive) {
-            sparse_moe_prefill_q8_down_kernel<false, true>
+            sparse_moe_prefill_w8_down_kernel<false, true>
                 <<<shared_down_grid, kExpertThreads, 0, stream>>>(
                     shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
                     routed_sum, shared_scale, output, tokens, route_job_count);
         } else {
-            sparse_moe_prefill_q8_down_kernel<false, false>
+            sparse_moe_prefill_w8_down_kernel<false, false>
                 <<<shared_down_grid, kExpertThreads, 0, stream>>>(
                     shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
                     routed_sum, shared_scale, output, tokens, nullptr);
         }
+#endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
     }
 }

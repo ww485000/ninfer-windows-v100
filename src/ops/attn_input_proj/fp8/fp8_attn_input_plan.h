@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
@@ -13,17 +12,9 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr int kFp8AttnInputLastSimtT     = 5;
-inline constexpr int kFp8AttnInputLastSmallMmaT = 33;
-
 [[nodiscard]] std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy,
                                                                   std::int32_t min_tokens,
                                                                   std::int32_t max_tokens);
-
-void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                         Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
-void fp8_attn_input_a16_gemm_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                    Tensor& k, Tensor& v, cudaStream_t stream);
 
 void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, cudaStream_t stream);
@@ -37,5 +28,11 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream);
+
+#ifdef NINFER_VOLTA_BUILD
+void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& query,
+                                     const void* x_fp16, Tensor& gate, Tensor& key, Tensor& value,
+                                     cudaStream_t stream);
+#endif
 
 } // namespace ninfer::ops::detail

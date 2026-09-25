@@ -1,9 +1,8 @@
-#include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
-#include "core/device.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 
 #include <cuda_runtime.h>
 
@@ -91,7 +90,14 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed) {
-    std::vector<Invocation> invocations{
+#ifdef NINFER_VOLTA_BUILD
+    const std::array invocations{
+        Invocation{1, ops::LinearPolicy::A16Only},
+        Invocation{2, ops::LinearPolicy::A16Only},
+        Invocation{26, ops::LinearPolicy::A16Only},
+    };
+#else
+    const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
         Invocation{26, ops::LinearPolicy::A16Only},
@@ -100,20 +106,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Invocation{48, ops::LinearPolicy::AllowA8},
         Invocation{65, ops::LinearPolicy::AllowA8},
         Invocation{1024, ops::LinearPolicy::AllowA8},
-        Invocation{8, ops::LinearPolicy::AllowA8},
-        Invocation{16, ops::LinearPolicy::AllowA8},
-        Invocation{32, ops::LinearPolicy::AllowA8},
-        Invocation{64, ops::LinearPolicy::AllowA8},
-        Invocation{96, ops::LinearPolicy::AllowA8},
-        Invocation{128, ops::LinearPolicy::AllowA8},
-        Invocation{129, ops::LinearPolicy::AllowA8},
     };
-    for (int columns = 2; columns <= 24; ++columns) {
-        invocations.push_back({columns, ops::LinearPolicy::A16Only});
-    }
+#endif
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PackedWeight host_weight =
-        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
     const std::vector<std::int32_t> rows = sampled_indices(n);
     const std::vector<float> materialized_weight =
         quantized_weight::materialize_rows_fp32(host_weight, rows);
@@ -124,7 +121,12 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
     GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    std::vector<std::uint8_t> expected_weight = host_weight.payload;
+#ifdef NINFER_VOLTA_BUILD
+    ops::detail::fp8_prepack_qpn_sm70(weight);
+    device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
+#endif
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
@@ -134,31 +136,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Tensor x(device_activation.data(), DType::BF16, {k, invocation.tokens});
         Tensor residual(output.data(), DType::BF16, {n, invocation.tokens});
         const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, n, k, invocation.policy, invocation.tokens,
+            QType::FP8_E4M3FN_ROW_BF16S, n, k, invocation.policy, invocation.tokens,
             invocation.tokens);
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize FP8 linear_add");
-
-        if (invocation.tokens == 128) {
-            cudaStream_t stream;
-            cudaGraph_t graph;
-            cudaGraphExec_t executable;
-            CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-            ops::linear_add(x, weight, residual, invocation.policy, workspace, stream);
-            CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-            CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-            for (int replay = 0; replay < 2; ++replay) {
-                CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
-                                           cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaGraphLaunch(executable, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
-            CUDA_CHECK(cudaGraphExecDestroy(executable));
-            CUDA_CHECK(cudaGraphDestroy(graph));
-            CUDA_CHECK(cudaStreamDestroy(stream));
-        }
 
         const bool a8 =
             invocation.policy == ops::LinearPolicy::AllowA8 && invocation.tokens >= first_a8;
@@ -205,26 +187,28 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(activation.data()),
                                       activation.size() * sizeof(std::uint16_t)),
         "FP8 linear_add activation");
-    failures += verify_preserved(device_weight, host_weight.payload, "FP8 linear_add weight");
+    failures += verify_preserved(device_weight, expected_weight, "FP8 linear_add weight");
 
+#ifndef NINFER_VOLTA_BUILD
     const std::size_t a16_interval = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::A16Only, 1, 2048);
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::A16Only, 1, 2048);
     const std::size_t pre_boundary = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1, first_a8 - 1);
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, first_a8 - 1);
     const std::size_t hot_interval = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1, 48);
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, 48);
     const std::size_t exact_48 = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 48, 48);
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 48, 48);
     const std::size_t through_1024 = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1, 1024);
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, 1024);
     const std::size_t exact_1024 = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1024, 1024);
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1024, 1024);
     if (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
         through_1024 != exact_1024 || exact_1024 <= exact_48) {
         std::cerr << "FP8 linear_add [" << n << ',' << k
                   << "]: workspace interval contract mismatch\n";
         ++failures;
     }
+#endif
     return failures;
 }
 

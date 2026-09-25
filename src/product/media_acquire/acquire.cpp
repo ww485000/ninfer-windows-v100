@@ -1,7 +1,3 @@
-// windows.h (pulled in transitively by the curl/winsock headers on Windows)
-// defines min/max as macros; the standard-conforming preprocessor expands
-// them at std::numeric_limits<...>::max() call sites. Same guard pattern as
-// request_log.cpp / context_cost.cpp.
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -383,7 +379,7 @@ std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& poli
         if (bytes.size() > policy.max_bytes) {
             throw Error(ErrorKind::BudgetExceeded, "media data exceeds byte limit");
         }
-        if (bytes.empty()) { throw std::invalid_argument("media source is empty"); }
+        if (bytes.empty()) { throw std::invalid_argument("media source contains no data"); }
         return bytes;
     }
     return read_path(source, policy);

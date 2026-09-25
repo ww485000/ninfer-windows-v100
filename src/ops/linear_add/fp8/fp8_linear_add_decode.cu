@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
@@ -6,6 +5,9 @@
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_epilogue.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
+#endif
 
 #include <cuda_bf16.h>
 
@@ -16,7 +18,7 @@ namespace {
 
 template <class Geometry>
 void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    using Schedule        = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+    using Schedule        = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);
     const Fp8ContiguousOutput destination{output, Geometry::kOutputRows};
@@ -33,20 +35,29 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
 
 void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   cudaStream_t stream) {
-    switch (resolve_fp8_geometry(weight.n, weight.k)) {
-    case Fp8GeometryId::N5120K6144:
-        launch<Fp8N5120K6144>(x, weight, residual, stream);
+    switch (resolve_fp8_problem(weight.n, weight.k)) {
+    case Fp8Problem::Residual6144:
+        launch<Fp8Residual6144Geometry>(x, weight, residual, stream);
         return;
-    case Fp8GeometryId::N5120K17408:
-        launch<Fp8N5120K17408>(x, weight, residual, stream);
+    case Fp8Problem::Residual17408:
+        launch<Fp8Residual17408Geometry>(x, weight, residual, stream);
         return;
-    case Fp8GeometryId::N14336K5120:
-    case Fp8GeometryId::N16384K5120:
-    case Fp8GeometryId::N34816K5120:
-    case Fp8GeometryId::N248320K5120:
+    case Fp8Problem::AttnInput:
+    case Fp8Problem::GdnInput:
+    case Fp8Problem::MlpGateUp:
+    case Fp8Problem::Vocabulary:
         break;
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");
 }
+
+#ifdef NINFER_VOLTA_BUILD
+void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                               cudaStream_t stream) {
+    launch_fp8_volta_qpn_with_output(
+        x, weight,
+        Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
+}
+#endif
 
 } // namespace ninfer::ops::detail

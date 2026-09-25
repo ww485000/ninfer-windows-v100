@@ -29,12 +29,8 @@ struct OpenAIChatRequest {
     bool return_progress   = false;
 };
 
-// RequestJson (upstream) keeps nested-object insertion order for the model-facing
-// serialization; the extra default_model argument is fork behavior (842617b1): when the
-// client omits "model", fall back to the single loaded model instead of rejecting.
 OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
-                                                const RequestLimits& limits,
-                                                const std::string& default_model);
+                                                const RequestLimits& limits);
 
 struct OpenAIChatResponseIdentity {
     std::string id;

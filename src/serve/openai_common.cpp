@@ -180,31 +180,23 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len) {
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    // `status` + `meta.n_ctx` are llama.cpp webui extensions: the client reads
-    // status.value to decide whether a model is loaded. A single loaded artifact
-    // is always loaded, so advertise it as such.
     const Json payload = {{"object", "list"},
                           {"data", Json::array({Json{{"id", model_id},
                                                      {"object", "model"},
                                                      {"created", created},
                                                      {"owned_by", "ninfer"},
-                                                     {"max_model_len", max_model_len},
-                                                     {"status", Json{{"value", "loaded"}}},
-                                                     {"meta", Json{{"n_ctx", max_model_len}}}}})}};
+                                                     {"max_model_len", max_model_len}}})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created,
                               std::uint32_t max_model_len) {
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    // `status` + `meta.n_ctx` are llama.cpp webui extensions (see make_models_list).
     const Json payload = {{"id", model_id},
                           {"object", "model"},
                           {"created", created},
                           {"owned_by", "ninfer"},
-                          {"max_model_len", max_model_len},
-                          {"status", Json{{"value", "loaded"}}},
-                          {"meta", Json{{"n_ctx", max_model_len}}}};
+                          {"max_model_len", max_model_len}};
     return payload.dump();
 }
 

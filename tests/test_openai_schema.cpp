@@ -47,13 +47,13 @@ Json base_request() {
                 {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
 }
 
-OpenAIChatRequest parse(Json body) {
-    return parse_chat_completion_request(body, limits(), "served-qwen");
-}
+OpenAIChatRequest parse(Json body) { return parse_chat_completion_request(body, limits()); }
 
 ResolvedPromptSemantics semantics(const GenerationRequest& request) {
     ServeOptions server;
-    return resolve_prompt_semantics(request, server);
+    ninfer::PromptCapabilities capabilities;
+    capabilities.enable_thinking = true;
+    return resolve_prompt_semantics(request, server, capabilities);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
@@ -118,17 +118,6 @@ int test_request_envelope_and_sampling() {
                   !defaults.timings_per_token && !defaults.return_progress &&
                   defaults.generation.max_tokens == limits().default_max_tokens,
               "protocol defaults remain outside GenerationRequest");
-
-    Json omitted_model = base_request();
-    omitted_model.erase("model");
-    failures += check(parse(omitted_model).model == "served-qwen",
-                      "omitted model resolves to the single loaded model");
-    for (const Json& value : Json::array({nullptr, "", 42})) {
-        Json fallback = base_request();
-        fallback["model"] = value;
-        failures += check(parse(fallback).model == "served-qwen",
-                          "Windows model fallback accepts absent model names");
-    }
 
     Json malformed              = base_request();
     malformed["stream_options"] = true;
@@ -550,8 +539,8 @@ int test_reasoning_and_extensions() {
     body                         = base_request();
     body["chat_template_kwargs"] = Json{{"future", 1}};
     failures +=
-        check(Json::parse(parse(body).generation.chat_template_kwargs_json).at("future") == 1,
-              "custom template keyword did not survive protocol parsing");
+        check(api_error([&] { (void)parse(body); }).code == "chat_template_option_not_supported",
+              "unknown meaningful template option rejected");
     body["chat_template_kwargs"] = Json{{"future", nullptr}};
     failures += check(parse(body).generation.messages.size() == 1,
                       "null unknown template option is neutral");

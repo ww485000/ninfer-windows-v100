@@ -2170,6 +2170,12 @@ int run_dflash2_cases() {
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_VOLTA_BUILD
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 / K8V4 KV-cache attention is unavailable on Volta
+        }
+#endif
         const auto run = [&](int width, int batch, int base, bool graph) {
             BatchAttentionCase c{width,
                                  {},
@@ -2214,6 +2220,12 @@ int run_batch_cases() {
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_VOLTA_BUILD
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 / K8V4 KV-cache attention is unavailable on Volta
+        }
+#endif
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
         failures += run_batch_case(kGeometries[0], storage,
@@ -2240,6 +2252,10 @@ int run_batch_cases() {
     failures +=
         run_batch_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 505u});
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {6, 61, 16391, 506u, false, true}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::BFloat16,
+                            {4, 13092, 32768, 507u, false, true}, MappingPattern::Fragmented);
     return failures;
 }
 
@@ -2282,6 +2298,12 @@ int run_geometry(const Geometry& geometry) {
                 run_a3_case(geometry, storage, {16, 17, 1025, 404u}, MappingPattern::Identity);
         }
     }
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_a1_case(geometry, KvCacheStorage::Int8Group64, {8, 17, 512, 405u},
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {8, 17, 512, 406u},
+                            MappingPattern::Fragmented);
+#endif
     return failures;
 }
 
@@ -2391,6 +2413,12 @@ int verify_workspace_capacity_contract() {
     for (const KvCacheStorage storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_VOLTA_BUILD
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 / K8V4 KV-cache attention is unavailable on Volta
+        }
+#endif
         constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 1025};
         constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 16, 2};
         const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(
@@ -2458,12 +2486,14 @@ int run_softmax_attention_causal_cache_tests() {
     }
 
     int failures = verify_workspace_capacity_contract();
+#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
     failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);
     failures += run_k8v4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
     failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
+#endif
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_fp8_cases();
     failures += run_batch_cases();
