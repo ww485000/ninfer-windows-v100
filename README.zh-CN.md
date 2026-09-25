@@ -102,7 +102,8 @@ powershell -ExecutionPolicy Bypass -Command `
 
 也可以在资源管理器中双击 `start-qwen38-official.bat` 或
 `start-qwen38-uncensored.bat`。服务运行期间请保持窗口打开，按 `Ctrl+C` 停止。两个脚本都使用
-7105 端口，因此同一时间只能启动一个。
+7105 端口，因此同一时间只能启动一个。双击 `stop-qwen38-server.bat` 可安全停止监听进程；如果
+7105 端口属于其他程序，停止脚本会拒绝结束它。
 
 脚本使用 INT8 KV、MTP K=3、prefill chunk 2048、单活跃请求、131,072-token 逻辑上下文、
 Device/Host 续写缓存和 CUDA Graph。切换到 uncensored：

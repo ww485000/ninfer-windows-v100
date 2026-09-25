@@ -105,7 +105,8 @@ Start the recommended V100 profile on localhost:
 
 Windows Explorer shortcuts are also provided: double-click `start-qwen38-official.bat` or
 `start-qwen38-uncensored.bat`. Keep the console open while serving and press `Ctrl+C` to stop.
-Both launchers use port 7105, so run only one at a time.
+Both launchers use port 7105, so run only one at a time. Double-click `stop-qwen38-server.bat` to
+stop the listener safely; it refuses to terminate a non-NInfer process that happens to own the port.
 
 The script selects INT8 KV, MTP K=3, prefill chunk 2048, one active request, 131,072-token logical
 context, Device/Host continuation retention, and CUDA Graphs. For the alternate model:
