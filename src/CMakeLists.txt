@@ -50,19 +50,18 @@ target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 # warpgroups to consumer warpgroups. Relocatable device code makes ptxas discard that contract, so
 # these self-contained kernels are intentionally compiled in a non-RDC archive and called through
 # host launchers from ninfer_ops.
-add_library(ninfer_nvfp4_non_rdc STATIC
-  ops/linear/nvfp4/nvfp4_w4a4_tma.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
 if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  target_sources(ninfer_nvfp4_non_rdc PRIVATE
+  add_library(ninfer_nvfp4_non_rdc STATIC
+    ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+    ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
     ops/softmax_attention/dense/causal_cache/prompt_nvfp4_non_rdc.cu)
+  ninfer_internal_includes(ninfer_nvfp4_non_rdc)
+  set_target_properties(ninfer_nvfp4_non_rdc PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  target_compile_options(ninfer_nvfp4_non_rdc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
 endif()
-ninfer_internal_includes(ninfer_nvfp4_non_rdc)
-set_target_properties(ninfer_nvfp4_non_rdc PROPERTIES
-  CUDA_SEPARABLE_COMPILATION OFF
-  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-target_compile_options(ninfer_nvfp4_non_rdc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
@@ -310,6 +309,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/target_logprobs.cpp
   ops/wrapper/vision_pos_embed.cpp)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_sources(ninfer_ops PRIVATE ops/linear/nvfp4/nvfp4_tma_unavailable.cpp)
   # Volta-only execution leaves. Shared Op contracts and planners remain in the
   # ordinary source list above; these files provide the sm_70 implementations.
   target_sources(ninfer_ops PRIVATE
@@ -385,13 +385,17 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
 endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+if(TARGET ninfer_nvfp4_non_rdc)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_non_rdc)
+endif()
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+target_compile_definitions(ninfer_text PRIVATE UTF8PROC_STATIC)
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
@@ -404,6 +408,9 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
     product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
   target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  if(WIN32)
+    target_link_libraries(ninfer_media_acquire PUBLIC ws2_32)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)

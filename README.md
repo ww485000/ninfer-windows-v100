@@ -103,8 +103,8 @@ mean output tokens per round over ten measured rounds after two warmups.
 
 ## Quick start
 
-NInfer requires 64-bit Linux, a Tesla V100 with CUDA Toolkit 12.8, CMake 3.28 or newer, a C++20
-host compiler, Ninja, `pkg-config`, FFmpeg
+NInfer requires a Tesla V100, CUDA Toolkit 12.8 or 12.9, CMake 3.28 or newer, and a C++20 host
+compiler. Linux additionally requires Ninja and `pkg-config`. Both platforms require FFmpeg
 development libraries (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and
 `libswscale >= 7`), and `libcurl >= 7.85`. This port builds for `sm_70`.
 
@@ -116,6 +116,17 @@ cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES=70
 cmake --build build-v100 -j
 ```
+
+For native Windows, install Visual Studio 2022 with the **Desktop development with C++** workload,
+CUDA Toolkit 12.8 or 12.9, and vcpkg. The script detects the VS developer environment, validates
+the V100, installs the manifest dependencies, and builds all three applications:
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command ".\build-v100-windows.ps1 -VcpkgRoot C:\src\vcpkg -Clean 2>&1 | Tee-Object -FilePath build-v100.log"
+```
+
+Windows outputs are under `build-v100\apps\Release`. The native build supports Tesla boards in
+TCC mode; the script accepts GPUs reported as V100 or the OEM `PG503-216` identifier.
 
 The same five `.ninfer` artifacts use the public Engine/CLI/serving routes. See the
 [V100 port notes](docs/v100.md) for qualification and the preferred-GPU launcher.
