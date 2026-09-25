@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$StopMarkerPath = Join-Path $PSScriptRoot ".local\qwen38-stop-requested"
 
 if (-not $ModelPath) {
     if ($Variant -eq "uncensored") {
@@ -48,4 +49,11 @@ if ($LASTEXITCODE -ne 0) { throw "nvidia-smi failed with exit code $LASTEXITCODE
     --preserve-thinking `
     --pending-timeout-ms 600000
 
-if ($LASTEXITCODE -ne 0) { throw "ninfer-serve failed with exit code $LASTEXITCODE" }
+if ($LASTEXITCODE -ne 0) {
+    if (Test-Path -LiteralPath $StopMarkerPath -PathType Leaf) {
+        Remove-Item -LiteralPath $StopMarkerPath -Force -ErrorAction SilentlyContinue
+        Write-Host "NInfer server stopped."
+        exit 0
+    }
+    throw "ninfer-serve failed with exit code $LASTEXITCODE"
+}
