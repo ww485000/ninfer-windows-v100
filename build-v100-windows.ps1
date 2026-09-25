@@ -12,6 +12,22 @@ function Require-Command([string]$Name) {
   return $cmd.Source
 }
 
+# Windows PowerShell 5.1 turns native-process stderr into PowerShell ErrorRecord
+# objects. With $ErrorActionPreference='Stop', harmless MSBuild/CMake banners on
+# stderr can abort the script before we can inspect the native exit code. Run
+# native build commands with non-terminating stderr handling, then fail only on
+# their real process exit code.
+function Invoke-NativeCommand([string]$FilePath, [object[]]$Arguments) {
+  $oldPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    & $FilePath @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+    return $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $oldPreference
+  }
+}
+
 Write-Host "[NInfer V100] Native Windows/TCC build bootstrap"
 
 if (-not $VcpkgRoot) {
@@ -100,12 +116,13 @@ $configureArgs = @(
   "-DBUILD_TESTING=OFF",
   "-DNINFER_BUILD_BENCHMARKS=OFF"
 )
-& $cmake @configureArgs
-if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
+$configureExit = Invoke-NativeCommand $cmake $configureArgs
+if ($configureExit -ne 0) { throw "CMake configure failed with exit code $configureExit" }
 
 Write-Host "[Build] Release"
-& $cmake --build $BuildDir --config Release --parallel
-if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
+$buildArgs = @("--build", $BuildDir, "--config", "Release", "--parallel")
+$buildExit = Invoke-NativeCommand $cmake $buildArgs
+if ($buildExit -ne 0) { throw "Build failed with exit code $buildExit" }
 
 $cli = Join-Path $BuildDir "apps\Release\ninfer.exe"
 $serve = Join-Path $BuildDir "apps\Release\ninfer-serve.exe"
