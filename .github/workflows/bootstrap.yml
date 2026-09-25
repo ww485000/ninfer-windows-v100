@@ -24,6 +24,10 @@ jobs:
           rsync -a --delete \
             --exclude='.git' \
             --exclude='.github/workflows/bootstrap.yml' \
+            --exclude='CMakeLists.txt' \
+            --exclude='CMakePresets.json' \
+            --exclude='build-v100-windows.ps1' \
+            --exclude='docs/windows-v100.md' \
             "$workdir/upstream/" ./
           git status --short
 
