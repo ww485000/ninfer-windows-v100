@@ -31,7 +31,7 @@ Real generation and serving checks also pass:
 - uncensored artifact SHA-256 verified, loaded and served as `qwen3.8-27b-uncensored`;
 - deterministic greedy output and token IDs repeated exactly;
 - Chinese CLI generation, OpenAI `/v1/models`, and `/v1/chat/completions` verified;
-- 131,072-token INT8 KV service profile starts with CUDA Graphs enabled.
+- 240,000-token INT8 KV service profile starts with CUDA Graphs enabled.
 
 ## Supported platform
 
@@ -108,7 +108,7 @@ Windows Explorer shortcuts are also provided: double-click `start-qwen38-officia
 Both launchers use port 7105, so run only one at a time. Double-click `stop-qwen38-server.bat` to
 stop the listener safely; it refuses to terminate a non-NInfer process that happens to own the port.
 
-The script selects INT8 KV, MTP K=3, prefill chunk 2048, one active request, 131,072-token logical
+The script selects INT8 KV, MTP K=3, prefill chunk 2048, one active request, 240,000-token logical
 context, Device/Host continuation retention, and CUDA Graphs. For the alternate model:
 
 ```powershell

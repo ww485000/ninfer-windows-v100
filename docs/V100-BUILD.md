@@ -90,7 +90,7 @@ the Windows narrow-command-line encoding path.
 ```
 
 The qualified profile uses `--prefill-chunk 2048`, INT8 group-64 KV, MTP K=3, the optimized
-proposal head, 131,072 logical context tokens, one active request, one Device checkpoint, eight
+proposal head, 240,000 logical context tokens, one active request, one Device checkpoint, eight
 Host State slots, and 8GiB Host KV. Select `-Variant uncensored` to publish
 `qwen3.8-27b-uncensored` instead.
 

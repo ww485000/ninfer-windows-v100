@@ -29,7 +29,7 @@ Windows 10、INT8 group-64 KV、CUDA Graph、MTP K=3、优化 proposal head、pr
 - uncensored artifact SHA-256 校验通过，以 `qwen3.8-27b-uncensored` 独立发布；
 - greedy 输出和 token IDs 两次逐字节一致；
 - 中文 CLI、OpenAI `/v1/models` 和 `/v1/chat/completions` 验证通过；
-- 131,072-token INT8 KV 服务配置可启用 CUDA Graph 正常启动。
+- 240,000-token INT8 KV 服务配置可启用 CUDA Graph 正常启动。
 
 ## 支持平台
 
@@ -105,7 +105,7 @@ powershell -ExecutionPolicy Bypass -Command `
 7105 端口，因此同一时间只能启动一个。双击 `stop-qwen38-server.bat` 可安全停止监听进程；如果
 7105 端口属于其他程序，停止脚本会拒绝结束它。
 
-脚本使用 INT8 KV、MTP K=3、prefill chunk 2048、单活跃请求、131,072-token 逻辑上下文、
+脚本使用 INT8 KV、MTP K=3、prefill chunk 2048、单活跃请求、240,000-token 逻辑上下文、
 Device/Host 续写缓存和 CUDA Graph。切换到 uncensored：
 
 ```powershell

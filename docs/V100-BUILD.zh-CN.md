@@ -86,7 +86,7 @@ uncensored artifact 来自第三方，已降低安全对齐，且没有完整能
 ```
 
 验证配置使用 `--prefill-chunk 2048`、INT8 group-64 KV、MTP K=3、优化 proposal head、
-131,072 逻辑上下文、单活跃请求、一个 Device 检查点、八个 Host State 槽和 8GiB Host KV。
+240,000 逻辑上下文、单活跃请求、一个 Device 检查点、八个 Host State 槽和 8GiB Host KV。
 使用 `-Variant uncensored` 时，服务模型 ID 为 `qwen3.8-27b-uncensored`。
 
 模型加载完成后通过 HTTP 判断就绪：

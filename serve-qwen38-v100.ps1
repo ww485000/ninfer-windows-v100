@@ -36,7 +36,7 @@ if ($LASTEXITCODE -ne 0) { throw "nvidia-smi failed with exit code $LASTEXITCODE
     --port $Port `
     --device 0 `
     --model-id $ModelId `
-    --max-context 131072 `
+    --max-context 240000 `
     --prefill-chunk 2048 `
     --kv-capacity auto `
     --max-concurrency 1 `
